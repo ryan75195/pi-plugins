@@ -1,10 +1,8 @@
 # pi-plugins
 
-A collection of [pi coding agent](https://pi.dev) extensions, skills, prompts and themes.
+Extensions and plugins for AI coding agents — [pi](https://pi.dev) extensions and [opencode](https://opencode.ai) plugins.
 
-Everything here is a [pi package](https://pi.dev) — install the whole repo, or cherry-pick single extensions by path.
-
-## Install
+## Install (pi)
 
 ```bash
 # Everything (all extensions in this repo)
@@ -15,11 +13,25 @@ mkdir -p ~/.pi/agent/extensions
 ln -s /path/to/pi-plugins/extensions/background-tasks ~/.pi/agent/extensions/background-tasks
 ```
 
+## Install (opencode)
+
+```bash
+mkdir -p ~/.config/opencode/plugins
+ln -s /path/to/pi-plugins/opencode/plugins/background-tasks.ts ~/.config/opencode/plugins/background-tasks.ts
+```
+
 ## Extensions
 
-| Extension | Description |
-|-----------|-------------|
-| [background-tasks](extensions/background-tasks/) | Claude Code-style background shell tasks: run commands without blocking, task IDs, output files, completion notifications, live task panel, interactive `/tasks` manager. |
+| Extension | Targets | Description |
+|-----------|---------|-------------|
+| [background-tasks](extensions/background-tasks/) / [opencode](opencode/) | pi, opencode | Claude Code-style background shell tasks: run commands without blocking, task IDs, output files, completion notifications. pi gets a live task panel + interactive `/tasks` manager; opencode gets session notifications + toasts. |
+
+## Development
+
+```bash
+npm install
+npm run typecheck   # typechecks pi + opencode extensions
+```
 
 ## Security
 

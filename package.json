@@ -5,6 +5,19 @@
   "keywords": ["pi-package"],
   "repository": "github:ryan75195/pi-plugins",
   "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit --strict --target esnext --module esnext --moduleResolution bundler --skipLibCheck opencode/plugins/background-tasks.ts extensions/background-tasks/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/sdk": "latest",
+    "typebox": "*",
+    "typescript": "^5"
+  },
   "pi": {
     "extensions": ["./extensions"]
   }

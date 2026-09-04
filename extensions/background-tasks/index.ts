@@ -23,7 +23,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Container, Key, matchesKey, SelectList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Container, Key, matchesKey, SelectList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, open } from "node:fs/promises";
@@ -654,7 +654,8 @@ export default function (pi: ExtensionAPI) {
 			| undefined;
 		const status = details?.status ?? "completed";
 		const color = status === "completed" ? "success" : status === "stopped" ? "warning" : "error";
-		const firstLine = (message.content ?? "").split("\n")[0];
+		const contentText = typeof message.content === "string" ? message.content : "";
+		const firstLine = contentText.split("\n")[0];
 		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
 		box.addChild(new Text(`${theme.fg(color, statusIcon(status as TaskStatus))} ${firstLine}`, 0, 0));
 		if (expanded && details?.outputFile) {
