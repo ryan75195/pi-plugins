@@ -176,14 +176,9 @@ const tui: TuiPlugin = async (api) => {
 	}
 
 	function summaryLine(list: TaskSnapshot[]): string {
-		const runCount = list.filter((t) => t.status === "running").length
-		const head = `${runCount > 0 ? spinnerFrame() : statusIcon(list[0]!.status)} Background tasks ${runCount ? `${runCount} running` : `${list.length} finished`}`
-		const mostRelevant = list.find((t) => t.status === "running" && pidAlive(t.pid)) ?? list[0]!
-		const label = mostRelevant.description
-			? `${mostRelevant.description} (${mostRelevant.command})`
-			: mostRelevant.command
-		const elapsed = humanDuration((mostRelevant.finishedAt ?? now()) - mostRelevant.startedAt)
-		return `${head} ▸ ${truncate(label, MAX_LABEL_WIDTH)} ${elapsed}`
+		const runCount = list.filter((t) => t.status === "running" && pidAlive(t.pid)).length
+		const icon = runCount > 0 ? spinnerFrame() : statusIcon(list[0]!.status)
+		return `${icon} Background tasks · ${runCount} running · ${list.length} total`
 	}
 
 	function rowText(task: TaskSnapshot): string {
