@@ -7,8 +7,8 @@
  * a JSON file; this plugin polls it and renders:
  *
  *   collapsed (default):  ⠼ Background tasks 1/2 ▸ dev server 1m12s
- *   expanded:             full rows with elapsed time, exit codes, and
- *                         click-to-stop (inline two-click confirm)
+ *   expanded:             full rows with elapsed time, exit codes; clicking a
+ *                         running row opens a confirm dialog to stop it
  *
  * Install: add the path to this file to the `plugin` array in
  * ~/.config/opencode/tui.json (or .opencode/tui.json):
@@ -47,7 +47,6 @@ const STATE_FILE = join(tmpdir(), "opencode-background-tasks", "state.json")
 const POLL_MS = 700
 const TICK_MS = 1000
 const SIDEBAR_ORDER = 500
-const CONFIRM_RESET_MS = 5000
 const MAX_LABEL_WIDTH = 48
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -116,8 +115,6 @@ const tui: TuiPlugin = async (api) => {
 	const [tasks, setTasks] = createSignal<TaskSnapshot[]>([])
 	const [now, setNow] = createSignal(Date.now())
 	const [expanded, setExpanded] = createSignal(false)
-	const [confirmingId, setConfirmingId] = createSignal<string | null>(null)
-	let confirmTimer: ReturnType<typeof setTimeout> | undefined
 
 	const poll = async () => {
 		setTasks(await readTasks())
@@ -129,28 +126,9 @@ const tui: TuiPlugin = async (api) => {
 	const stopPolling = () => {
 		clearInterval(pollTimer)
 		clearInterval(tickTimer)
-		if (confirmTimer) clearTimeout(confirmTimer)
 	}
 	api.lifecycle.onDispose(stopPolling)
 	onCleanup(stopPolling)
-
-	function armConfirm(id: string) {
-		setConfirmingId(id)
-		if (confirmTimer) clearTimeout(confirmTimer)
-		confirmTimer = setTimeout(() => setConfirmingId(null), CONFIRM_RESET_MS)
-	}
-
-	function stopTask(task: TaskSnapshot) {
-		setConfirmingId(null)
-		api.ui.toast({
-			title: "Stopping task",
-			message: `${task.id}: ${task.command}`,
-			variant: "warning",
-			duration: 3000,
-		})
-		if (task.pid) killTree(task.pid)
-		poll()
-	}
 
 	function colorFor(status: TaskStatus, alive = true): string {
 		if (status === "running" && !alive) return "textMuted"
@@ -166,14 +144,35 @@ const tui: TuiPlugin = async (api) => {
 		}
 	}
 
-	function rowText(task: TaskSnapshot): string {
-		const alive = pidAlive(task.pid)
-		const icon = task.status === "running" && alive ? spinnerFrame() : statusIcon(task.status)
-		const elapsed = humanDuration((task.finishedAt ?? now()) - task.startedAt)
-		const right =
-			task.status === "running" ? (alive ? elapsed : `${elapsed} · gone`) : `${elapsed}${task.exitCode === null ? "" : ` · exit ${task.exitCode}`}`
-		const label = task.description ? `${task.description} (${task.command})` : task.command
-		return `${icon} ${task.id} ${truncate(label, MAX_LABEL_WIDTH)}  ${right}`
+	function requestStop(task: TaskSnapshot) {
+		api.ui.toast({
+			title: "Stopping task",
+			message: `${task.id}: ${task.command}`,
+			variant: "warning",
+			duration: 3000,
+		})
+		if (task.pid) killTree(task.pid)
+		poll()
+	}
+
+	// NOTE: triggered on mouse-UP, not mouse-down. On mouse-down the dialog
+	// opens mid-click and the subsequent mouse-up dismisses it immediately.
+	function confirmStop(task: TaskSnapshot) {
+		try {
+			api.ui.dialog.replace(() =>
+				api.ui.DialogConfirm({
+					title: "Stop background task",
+					message: `${task.id}: ${task.command}`,
+					onConfirm: () => {
+						api.ui.dialog.clear()
+						requestStop(task)
+					},
+					onCancel: () => api.ui.dialog.clear(),
+				}),
+			)
+		} catch {
+			requestStop(task)
+		}
 	}
 
 	function summaryLine(list: TaskSnapshot[]): string {
@@ -185,6 +184,16 @@ const tui: TuiPlugin = async (api) => {
 			: mostRelevant.command
 		const elapsed = humanDuration((mostRelevant.finishedAt ?? now()) - mostRelevant.startedAt)
 		return `${head} ▸ ${truncate(label, MAX_LABEL_WIDTH)} ${elapsed}`
+	}
+
+	function rowText(task: TaskSnapshot): string {
+		const alive = pidAlive(task.pid)
+		const icon = task.status === "running" && alive ? spinnerFrame() : statusIcon(task.status)
+		const elapsed = humanDuration((task.finishedAt ?? now()) - task.startedAt)
+		const right =
+			task.status === "running" ? (alive ? elapsed : `${elapsed} · gone`) : `${elapsed}${task.exitCode === null ? "" : ` · exit ${task.exitCode}`}`
+		const label = task.description ? `${task.description} (${task.command})` : task.command
+		return `${icon} ${task.id} ${truncate(label, MAX_LABEL_WIDTH)}  ${right}`
 	}
 
 	api.slots.register({
@@ -202,36 +211,16 @@ const tui: TuiPlugin = async (api) => {
 							</box>
 							<Show when={expanded()}>
 								<For each={sessionTasks()}>
-									{(task) => {
-										const alive = pidAlive(task.pid)
-										const running = task.status === "running" && alive
-										const color = colorFor(task.status, alive)
-										return (
-											<Show
-												when={running && confirmingId() === task.id}
-												fallback={
-													<box
-														flexDirection="row"
-														justifyContent="space-between"
-														onMouseDown={() => {
-															if (running) armConfirm(task.id)
-														}}
-													>
-														<text fg={color}>{rowText(task)}</text>
-													</box>
-												}
-											>
-												<box flexDirection="row" gap={2}>
-													<text fg={api.theme.current.error} attributes="bold" onMouseDown={() => stopTask(task)}>
-														[stop {task.id}]
-													</text>
-													<text fg={api.theme.current.textMuted} onMouseDown={() => setConfirmingId(null)}>
-														[keep]
-													</text>
-												</box>
-											</Show>
-										)
-									}}
+									{(task) => (
+										<text
+											fg={colorFor(task.status, pidAlive(task.pid))}
+											onMouseUp={() => {
+												if (task.status === "running" && pidAlive(task.pid)) confirmStop(task)
+											}}
+										>
+											{rowText(task)}
+										</text>
+									)}
 								</For>
 							</Show>
 						</box>
