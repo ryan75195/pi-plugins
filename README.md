@@ -19,7 +19,7 @@ ln -s /path/to/pi-plugins/extensions/background-tasks ~/.pi/agent/extensions/bac
 
 | Extension | Description |
 |-----------|-------------|
-| [background-tasks](extensions/background-tasks/) | Claude Code-style background shell tasks: run commands without blocking, task IDs, output files, completion notifications, `/tasks` command and widget. |
+| [background-tasks](extensions/background-tasks/) | Claude Code-style background shell tasks: run commands without blocking, task IDs, output files, completion notifications, live task panel, interactive `/tasks` manager. |
 
 ## Security
 

@@ -20,9 +20,10 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Container, Key, matchesKey, SelectList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, open } from "node:fs/promises";
@@ -76,6 +77,32 @@ function statusIcon(status: TaskStatus): string {
 	}
 }
 
+interface UiTheme {
+	fg(color: string, text: string): string;
+	bold(text: string): string;
+}
+
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const PANEL_FINISHED_LINGER_MS = 60_000; // finished tasks stay in the panel this long
+const OUTPUT_VIEW_LINES = 20; // visible lines in the output viewer
+
+function spinnerFrame(): string {
+	return SPINNER_FRAMES[Math.floor(Date.now() / 90) % SPINNER_FRAMES.length];
+}
+
+function statusColor(status: TaskStatus): string {
+	switch (status) {
+		case "running":
+			return "accent";
+		case "completed":
+			return "success";
+		case "stopped":
+			return "warning";
+		case "failed":
+			return "error";
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const tasks = new Map<string, BgTask>();
 	let lastCtx: ExtensionContext | undefined;
@@ -101,22 +128,102 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function sortedTasks(): BgTask[] {
+		return [...tasks.values()].sort((a, b) => {
+			if (a.status === "running" && b.status !== "running") return -1;
+			if (a.status !== "running" && b.status === "running") return 1;
+			return (b.finishedAt ?? b.startedAt) - (a.finishedAt ?? a.startedAt);
+		});
+	}
+
+	let panelTui: { requestRender(): void } | undefined;
+	let panelTicker: NodeJS.Timeout | undefined;
+
+	function stopPanelTicker() {
+		if (panelTicker) {
+			clearInterval(panelTicker);
+			panelTicker = undefined;
+		}
+	}
+
+	function startPanelTicker() {
+		if (panelTicker) return;
+		panelTicker = setInterval(() => {
+			const runningTasks = running();
+			if (runningTasks.length > 0) {
+				// Keep elapsed times spinning while tasks are live.
+				panelTui?.requestRender();
+				return;
+			}
+			// Nothing running: clear the panel once the last finished task has lingered long enough.
+			const lastFinished = Math.max(...[...tasks.values()].map((t) => t.finishedAt ?? 0));
+			if (Date.now() - lastFinished > PANEL_FINISHED_LINGER_MS) {
+				if (lastCtx?.hasUI) {
+					lastCtx.ui.setWidget("background-tasks", undefined);
+					lastCtx.ui.setStatus("background-tasks", undefined);
+				}
+				stopPanelTicker();
+			}
+		}, 500);
+		panelTicker.unref?.();
+	}
+
+	function renderTaskRow(t: BgTask, width: number, theme: UiTheme): string {
+		const icon = t.status === "running" ? spinnerFrame() : statusIcon(t.status);
+		const right =
+			t.status === "running"
+				? humanDuration(Date.now() - t.startedAt)
+				: `${humanDuration((t.finishedAt ?? Date.now()) - t.startedAt)}${t.exitCode === null ? "" : ` · exit ${t.exitCode}`}`;
+		const maxLeft = Math.max(1, width - visibleWidth(right) - 2);
+		let left = `${icon} ${t.id} ${taskLabel(t)}`;
+		if (visibleWidth(left) > maxLeft) left = truncateToWidth(left, maxLeft);
+		const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+		return theme.fg(statusColor(t.status), left + pad + right);
+	}
+
+	function taskPanelComponent(theme: UiTheme) {
+		return {
+			render(width: number): string[] {
+				const list = sortedTasks();
+				const lines: string[] = [];
+				const runningCount = list.filter((t) => t.status === "running").length;
+				const header =
+					runningCount > 0
+						? `${spinnerFrame()} ${runningCount} background task${runningCount === 1 ? "" : "s"} running · /tasks for details`
+						: `background tasks · /tasks for details`;
+				lines.push(theme.fg("dim", truncateToWidth(header, width)));
+				for (const t of list.slice(0, 8)) {
+					lines.push(renderTaskRow(t, width, theme));
+				}
+				if (list.length > 8) lines.push(theme.fg("dim", `  … +${list.length - 8} more`));
+				return lines;
+			},
+			invalidate() {},
+		};
+	}
+
 	function updateWidget(ctx: ExtensionContext | undefined) {
 		if (!ctx?.hasUI) return;
-		const runningTasks = running();
-		if (runningTasks.length === 0) {
+		if (tasks.size === 0) {
 			ctx.ui.setWidget("background-tasks", undefined);
 			ctx.ui.setStatus("background-tasks", undefined);
+			stopPanelTicker();
 			return;
 		}
-		const lines = runningTasks.slice(0, 6).map((t) => {
-			const label = t.description ? `${t.description} (${t.command})` : t.command;
-			const since = new Date(t.startedAt).toLocaleTimeString();
-			return `${statusIcon("running")} ${t.id} ${label} — running since ${since}`;
-		});
-		if (runningTasks.length > 6) lines.push(`  … and ${runningTasks.length - 6} more`);
-		ctx.ui.setWidget("background-tasks", lines);
-		ctx.ui.setStatus("background-tasks", `${runningTasks.length} background task(s) — /tasks`);
+		startPanelTicker();
+		ctx.ui.setWidget(
+			"background-tasks",
+			(tui, theme) => {
+				panelTui = tui;
+				return taskPanelComponent(theme);
+			},
+			{ placement: "belowEditor" },
+		);
+		const runningCount = running().length;
+		ctx.ui.setStatus(
+			"background-tasks",
+			runningCount > 0 ? `${runningCount} background task${runningCount === 1 ? "" : "s"} — /tasks` : undefined,
+		);
 	}
 
 	function taskLabel(t: BgTask): string {
@@ -409,15 +516,134 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	function taskPicker(ctx: ExtensionContext, title: string, items: Array<{ value: string; label: string; description?: string }>): Promise<string | null> {
+		return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
+			container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+			const list = new SelectList(items, Math.min(items.length, 10), {
+				selectedPrefix: (t) => theme.fg("accent", t),
+				selectedText: (t) => theme.fg("accent", t),
+				description: (t) => theme.fg("muted", t),
+				scrollInfo: (t) => theme.fg("dim", t),
+				noMatch: (t) => theme.fg("warning", t),
+			});
+			list.onSelect = (item) => done(item.value);
+			list.onCancel = () => done(null);
+			container.addChild(list);
+			container.addChild(new Text(theme.fg("dim", "↑↓ navigate · enter select · esc cancel"), 1, 0));
+			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
+			return {
+				render: (w) => container.render(w),
+				invalidate: () => container.invalidate(),
+				handleInput: (data) => {
+					list.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		});
+	}
+
+	function taskDescription(t: BgTask): string {
+		const duration = humanDuration((t.finishedAt ?? Date.now()) - t.startedAt);
+		const exit = t.exitCode === null ? "" : ` · exit ${t.exitCode}`;
+		const started = new Date(t.startedAt).toLocaleTimeString();
+		return `${t.status} · ${duration}${exit} · started ${started}`;
+	}
+
+	async function showOutputViewer(ctx: ExtensionContext, task: BgTask): Promise<void> {
+		const { text, truncated } = await tailOfFile(task.outputFile, 256 * 1024);
+		const lines = text.split("\n");
+		const total = lines.length;
+		let offset = 0; // lines scrolled up from the bottom (tail)
+		const maxOffset = Math.max(0, total - OUTPUT_VIEW_LINES);
+		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+			const header = new Text("", 1, 0);
+			const body = new Text("", 0, 0);
+			const draw = (width: number) => {
+				const from = Math.max(0, total - OUTPUT_VIEW_LINES - offset);
+				const to = total - offset;
+				const visible = lines.slice(from, to);
+				header.setText(theme.fg("accent", theme.bold(`Output · ${task.id} ${task.command}`)));
+				const rendered = visible.map((l) => truncateToWidth(l.replace(/\t/g, "    "), width));
+				const hasContent = rendered.some((l) => l.trim().length > 0);
+				body.setText(hasContent ? rendered.join("\n") : theme.fg("dim", "(no output yet)"));
+			};
+			const container = new Container();
+			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
+			container.addChild(header);
+			container.addChild(body);
+			container.addChild(new Text(theme.fg("dim", `↑↓ scroll · ←→ page · esc close${truncated ? " · (older output omitted, full file on disk)" : ""}`), 1, 0));
+			container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
+			return {
+				render: (w) => {
+					draw(w);
+					return container.render(w);
+				},
+				invalidate: () => container.invalidate(),
+				handleInput: (data) => {
+					if (matchesKey(data, Key.escape) || data === "q") {
+						done();
+						return;
+					}
+					if (matchesKey(data, Key.up)) offset = Math.min(offset + 1, maxOffset);
+					else if (matchesKey(data, Key.down)) offset = Math.max(0, offset - 1);
+					else if (matchesKey(data, Key.left)) offset = Math.min(offset + OUTPUT_VIEW_LINES, maxOffset);
+					else if (matchesKey(data, Key.right)) offset = Math.max(0, offset - OUTPUT_VIEW_LINES);
+					else return;
+					tui.requestRender();
+				},
+			};
+		}, { overlay: true });
+	}
+
 	pi.registerCommand("tasks", {
-		description: "List background tasks (running and finished)",
+		description: "Manage background tasks (view output, stop)",
 		handler: async (_args, ctx) => {
 			if (tasks.size === 0) {
 				ctx.ui.notify("No background tasks this session.", "info");
 				return;
 			}
-			const lines = [...tasks.values()].map((t) => formatTask(t));
-			ctx.ui.notify(lines.join("\n"), "info");
+			if (ctx.mode !== "tui") {
+				// Non-interactive fallback: plain text listing.
+				const lines = [...tasks.values()].map((t) => formatTask(t));
+				ctx.ui.notify(lines.join("\n"), "info");
+				return;
+			}
+			for (;;) {
+				const list = sortedTasks();
+				if (list.length === 0) {
+					ctx.ui.notify("No background tasks this session.", "info");
+					return;
+				}
+				const items = list.map((t) => ({
+					value: t.id,
+					label: `${statusIcon(t.status)} ${t.id}  ${taskLabel(t)}`,
+					description: taskDescription(t),
+				}));
+				items.push({ value: "__close", label: "Close", description: "Exit the task manager" });
+				const picked = await taskPicker(ctx, "Background tasks", items);
+				if (!picked || picked === "__close") return;
+				const task = tasks.get(picked);
+				if (!task) continue;
+				for (;;) {
+					const actions: Array<{ value: string; label: string; description?: string }> = [
+						{ value: "view", label: "View output", description: `${task.outputFile}${task.truncated ? " (truncated at 50MB)" : ""}` },
+					];
+					if (task.status === "running") {
+						actions.push({ value: "stop", label: "Stop task", description: "Kill the process tree" });
+					}
+					actions.push({ value: "back", label: "Back", description: "Return to the task list" });
+					const action = await taskPicker(ctx, `Task ${task.id} — ${task.status}`, actions);
+					if (!action || action === "back") break;
+					if (action === "view") {
+						await showOutputViewer(ctx, task);
+					} else if (action === "stop") {
+						void stopTask(task);
+						ctx.ui.notify(`Stopping ${task.id}…`, "info");
+					}
+				}
+			}
 		},
 	});
 

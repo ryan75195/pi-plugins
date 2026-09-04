@@ -16,10 +16,10 @@ its next turn — even if it already finished its previous response.
 | `task_stop` | Kill a running task (entire process tree — works on Windows via `taskkill /T /F`). |
 | `task_list` | List all tasks from this session with status, exit codes, output files. |
 
-## Human-facing UI
+## Human-facing TUI
 
-- `/tasks` command — notify-style listing of all tasks
-- Widget above the editor showing running tasks while any are active
+- **Live task panel** below the editor while tasks exist: animated spinner, live elapsed time, right-aligned status/exit-code columns. Running tasks first; finished tasks linger ~60s then clear automatically.
+- **`/tasks` interactive manager** (TUI): pick a task → view its output in a scrollable overlay (`↑↓` scroll, `←→` page, `esc` close) or stop it; `esc` backs out. Non-TUI modes get a plain text listing.
 - Status-line entry showing running task count
 - Colored completion notifications (green = completed, yellow = stopped, red = failed)
 
