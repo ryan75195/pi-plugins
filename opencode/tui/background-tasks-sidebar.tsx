@@ -40,10 +40,13 @@ interface TaskSnapshot {
 	status: TaskStatus
 	outputFile: string
 	truncated: boolean
+	foreground?: boolean
+	backgrounded?: boolean
 }
 
 const STATE_FILE = join(tmpdir(), "opencode-background-tasks", "state.json")
 const REQUESTS_FILE = join(tmpdir(), "opencode-background-tasks", "requests.json")
+const HINT_MAX_LABEL = 44
 const POLL_MS = 700
 const TICK_MS = 1000
 const SIDEBAR_ORDER = 500
@@ -96,14 +99,26 @@ function pidAlive(pid: number | undefined): boolean {
  * is removed from the registry and drops out of the sidebar.
  */
 async function requestStopTask(task: TaskSnapshot): Promise<void> {
-	let current: { stop?: string[] } = { stop: [] }
+	await writeRequest((req) => ({ ...req, stop: [...new Set([...(req.stop ?? []), task.id])] }))
+}
+
+/**
+ * Ask the server plugin to background the foreground task(s) of a session
+ * (ctrl+b). The waiting bash tool call returns immediately and the
+ * conversation is freed; the result arrives as a completion notification.
+ */
+async function requestBackgroundSession(sessionID: string): Promise<void> {
+	await writeRequest((req) => ({ ...req, backgroundSessions: [...new Set([...(req.backgroundSessions ?? []), sessionID])] }))
+}
+
+async function writeRequest(mutate: (req: { stop?: string[]; backgroundSessions?: string[] }) => { stop?: string[]; backgroundSessions?: string[] }): Promise<void> {
+	let current: { stop?: string[]; backgroundSessions?: string[] } = {}
 	try {
-		current = JSON.parse(await readFile(REQUESTS_FILE, "utf8")) as { stop?: string[] }
+		current = JSON.parse(await readFile(REQUESTS_FILE, "utf8"))
 	} catch {
 		// no requests yet
 	}
-	const stop = new Set([...(current.stop ?? []), task.id])
-	await writeFile(REQUESTS_FILE, JSON.stringify({ stop: [...stop] }))
+	await writeFile(REQUESTS_FILE, JSON.stringify(mutate(current)))
 }
 
 async function readTasks(): Promise<TaskSnapshot[]> {
@@ -119,6 +134,41 @@ const tui: TuiPlugin = async (api) => {
 	const [tasks, setTasks] = createSignal<TaskSnapshot[]>([])
 	const [now, setNow] = createSignal(Date.now())
 	const [expanded, setExpanded] = createSignal(false)
+
+	function foregroundForSession(sessionID: string): TaskSnapshot | undefined {
+		return tasks().find((t) => t.sessionID === sessionID && t.foreground && !t.backgrounded && t.status === "running" && pidAlive(t.pid))
+	}
+
+	// ctrl+b: background the foreground command of the current session.
+	api.keymap.registerLayer({
+		commands: [
+			{
+				name: "background_tasks.background",
+				title: "Background running command",
+				desc: "Move the blocking shell command to the background and free the chat",
+				category: "Background tasks",
+				run() {
+					const current = api.route.current
+					if (current.name !== "session") return
+					const sessionID = (current.params as { sessionID?: string } | undefined)?.sessionID
+					if (!sessionID) return
+					const task = foregroundForSession(sessionID)
+					if (!task) {
+						api.ui.toast({ title: "Nothing to background", message: "No blocking command is running.", variant: "info" })
+						return
+					}
+					void requestBackgroundSession(sessionID)
+					api.ui.toast({
+						title: "Moved to background",
+						message: `${task.id}: ${truncate(task.command, 60)} — you'll get the result when it finishes`,
+						variant: "success",
+						duration: 4000,
+					})
+				},
+			},
+		],
+		bindings: [{ key: "ctrl+b", cmd: "background_tasks.background" }],
+	})
 
 	const poll = async () => {
 		setTasks(await readTasks())
@@ -196,6 +246,27 @@ const tui: TuiPlugin = async (api) => {
 	api.slots.register({
 		order: SIDEBAR_ORDER,
 		slots: {
+			// Hint at the bottom of the screen while a command is blocking the
+			// conversation (like Claude Code's ctrl+b affordance).
+			app_bottom() {
+				const current = api.route.current
+				if (current.name !== "session") return null
+				const sessionID = (current.params as { sessionID?: string } | undefined)?.sessionID
+				if (!sessionID) return null
+				const task = foregroundForSession(sessionID)
+				return (
+					<Show when={task}>
+						{(t) => (
+							<box flexDirection="row" paddingLeft={1}>
+								<text fg={api.theme.current.primary}>ctrl+b</text>
+								<text fg={api.theme.current.textMuted}>
+									{` background · ${t().id} ${truncate(t().command, HINT_MAX_LABEL)} ${humanDuration(now() - t().startedAt)}`}
+								</text>
+							</box>
+						)}
+					</Show>
+				)
+			},
 			sidebar_content(_ctx: unknown, props: SlotProps) {
 				const sessionTasks = createMemo(() => tasks().filter((t) => t.sessionID === props.session_id))
 				return (

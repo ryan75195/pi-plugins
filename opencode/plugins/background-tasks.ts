@@ -21,11 +21,11 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { spawn, execSync, type ChildProcess } from "node:child_process"
-import { createWriteStream } from "node:fs"
+import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process"
+import { createWriteStream, existsSync } from "node:fs"
 import { mkdir, open, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, basename } from "node:path"
 import { randomUUID } from "node:crypto"
 
 const MAX_OUTPUT_BYTES = 50 * 1024 * 1024 // 50MB cap per task
@@ -52,6 +52,10 @@ interface BgTask {
 	stopRequested: boolean
 	waiters: Array<() => void>
 	timeoutTimer?: ReturnType<typeof setTimeout>
+	/** Started by the replaced `bash` tool and blocking the conversation. */
+	foreground?: boolean
+	/** A foreground task the user moved to the background with ctrl+b. */
+	backgrounded?: boolean
 }
 
 /**
@@ -223,13 +227,18 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			// Process stop requests written by the TUI sidebar plugin.
 			void (async () => {
 				let ids: string[] = []
+				let backgroundSessions: string[] = []
 				try {
-					const raw = JSON.parse(await readFile(REQUESTS_FILE, "utf8")) as { stop?: string[] }
+					const raw = JSON.parse(await readFile(REQUESTS_FILE, "utf8")) as {
+						stop?: string[]
+						backgroundSessions?: string[]
+					}
 					ids = raw.stop ?? []
+					backgroundSessions = raw.backgroundSessions ?? []
 				} catch {
 					return
 				}
-				if (ids.length === 0) return
+				if (ids.length === 0 && backgroundSessions.length === 0) return
 				try {
 					await writeFile(REQUESTS_FILE, JSON.stringify({ stop: [] }))
 				} catch {
@@ -239,6 +248,17 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 					const task = tasks.get(id)
 					if (task && task.status === "running") {
 						void stopTask(task)
+					}
+				}
+				// ctrl+b from the TUI: move the session's foreground task(s) to the
+				// background. The waiting bash tool call notices the flag and
+				// returns immediately, freeing the conversation.
+				for (const sid of backgroundSessions) {
+					for (const t of tasks.values()) {
+						if (t.sessionID === sid && t.foreground && !t.backgrounded && t.status === "running") {
+							t.backgrounded = true
+							void persistState(tasks)
+						}
 					}
 				}
 			})()
@@ -253,15 +273,28 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 		}
 	}
 
-	function startTask(command: string, description: string | undefined, timeoutMs: number | undefined, sessionID: string): BgTask {
+	function startTask(
+		command: string,
+		description: string | undefined,
+		timeoutMs: number | undefined,
+		sessionID: string,
+		opts?: { foreground?: boolean; shell?: { file: string; args: string[] } },
+	): BgTask {
 		const id = randomUUID().slice(0, 8)
 		const outputFile = join(OUTPUT_DIR, `${id}.log`)
-		const child = spawn(command, {
-			shell: true,
-			cwd: directory,
-			env: { ...process.env, OPENCODE_BG_TASK_ID: id },
-			stdio: ["ignore", "pipe", "pipe"],
-		})
+		const child = opts?.shell
+			? spawn(opts.shell.file, opts.shell.args, {
+					cwd: directory,
+					env: { ...process.env, OPENCODE_BG_TASK_ID: id },
+					stdio: ["ignore", "pipe", "pipe"],
+					windowsHide: true,
+				})
+			: spawn(command, {
+					shell: true,
+					cwd: directory,
+					env: { ...process.env, OPENCODE_BG_TASK_ID: id },
+					stdio: ["ignore", "pipe", "pipe"],
+				})
 
 		const task: BgTask = {
 			id,
@@ -278,6 +311,8 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			notified: false,
 			stopRequested: false,
 			waiters: [],
+			foreground: opts?.foreground ?? false,
+			backgrounded: false,
 		}
 		tasks.set(id, task)
 		ensureRequestPoller()
@@ -313,7 +348,10 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 				task.status = task.stopRequested ? "stopped" : code === 0 ? "completed" : "failed"
 			}
 			if (!out.writableEnded) out.end()
-			void notifyCompletion(task)
+			// Foreground tasks that completed normally already returned their
+			// output to the agent via the tool result — only notify when the task
+			// was backgrounded (or started explicitly in the background).
+			if (!task.foreground || task.backgrounded) void notifyCompletion(task)
 			for (const w of task.waiters) w()
 			task.waiters = []
 			// Stopped tasks are removed entirely so they drop out of the UI.
@@ -372,6 +410,70 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 		})
 	}
 
+	/**
+	 * Resolve the shell used for the foreground `bash` tool, mirroring
+	 * opencode's own preference order (pwsh → powershell → gitbash → cmd on
+	 * Windows; $SHELL → bash → zsh → sh elsewhere).
+	 */
+	function resolveShell(): { file: string; ps?: boolean; cmd?: boolean; kind: "bash" | "zsh" | "sh" } {
+		if (process.platform === "win32") {
+			const which = (name: string): string | undefined => {
+				try {
+					const out = execFileSync("where", [name], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+					return out.split(/\r?\n/).find((l) => l.trim())?.trim()
+				} catch {
+					return undefined
+				}
+			}
+			const pwsh = which("pwsh") ?? which("powershell")
+			const git = which("git")
+			const gitbash = git ? join(git, "..", "..", "bin", "bash.exe") : undefined
+			const file = pwsh ?? (gitbash && existsSync(gitbash) ? gitbash : undefined) ?? process.env.COMSPEC ?? "cmd.exe"
+			const base = basename(file).toLowerCase()
+			if (base.startsWith("pwsh") || base.startsWith("powershell")) return { file, ps: true, kind: "sh" }
+			if (base === "bash.exe") return { file, kind: "bash" }
+			return { file, cmd: true, kind: "sh" }
+		}
+		for (const candidate of [process.env.SHELL, "/bin/bash", "/bin/zsh", "/bin/sh"]) {
+			if (candidate && existsSync(candidate)) {
+				const base = basename(candidate)
+				const kind = base === "bash" ? "bash" : base === "zsh" ? "zsh" : "sh"
+				return { file: candidate, kind }
+			}
+		}
+		return { file: "/bin/sh", kind: "sh" }
+	}
+
+	let cachedShell: ReturnType<typeof resolveShell> | undefined
+	function getShell() {
+		cachedShell ??= resolveShell()
+		return cachedShell
+	}
+
+	function shellArgs(shell: ReturnType<typeof resolveShell>, command: string, cwd: string): string[] {
+		if (shell.kind === "bash") {
+			return [
+				"-l",
+				"-c",
+				`\nshopt -s expand_aliases\n[[ -f ~/.bashrc ]] && source ~/.bashrc >/dev/null 2>&1 || true\ncd -- "$1"\neval ${JSON.stringify(command)}\n`,
+				"opencode",
+				cwd,
+			]
+		}
+		if (shell.kind === "zsh") {
+			return [
+				"-l",
+				"-c",
+				`\n[[ -f ~/.zshenv ]] && source ~/.zshenv >/dev/null 2>&1 || true\n[[ -f "\${ZDOTDIR:-$HOME}/.zshrc" ]] && source "\${ZDOTDIR:-$HOME}/.zshrc" >/dev/null 2>&1 || true\ncd -- "$1"\neval ${JSON.stringify(command)}\n`,
+				"opencode",
+				cwd,
+			]
+		}
+		if (shell.cmd) return ["/c", command]
+		if (shell.ps) return ["-NoProfile", "-Command", command]
+		return ["-c", command]
+	}
+
 	return {
 		dispose: async () => {
 			// Stop our running tasks and drop our entries from the shared state
@@ -408,6 +510,74 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 		},
 
 		tool: {
+			// Replaces opencode's built-in bash: identical UX for short commands,
+			// but ctrl+b can move a long-running command to the background and
+			// free the conversation while it finishes.
+			bash: tool({
+				description:
+					"Run a shell command and return its output. While a command is running, the user can press ctrl+b in the TUI to move it to the background; " +
+					"the tool then returns immediately with a task ID and the conversation continues — you will receive a message with the command's result when it finishes. " +
+					"If the result says the command was moved to background, do not wait for it: keep going and handle the completion message when it arrives.",
+				args: {
+					command: tool.schema.string().describe("The shell command to run"),
+					description: tool.schema.string().optional().describe("Short human-readable label for this command"),
+					timeout: tool.schema.number().optional().describe("Kill the command after this many milliseconds"),
+				},
+				async execute(args, context) {
+					const shell = getShell()
+					const task = startTask(args.command, args.description, undefined, context.sessionID, {
+						foreground: true,
+						shell: { file: shell.file, args: shellArgs(shell, args.command, context.directory) },
+					})
+					const startedAt = Date.now()
+					const onAbort = () => {
+						task.stopRequested = true
+					}
+					context.abort.addEventListener("abort", onAbort, { once: true })
+
+					const finishStopped = async (reason: string) => {
+						await waitFor(task, 5_000)
+						tasks.delete(task.id)
+						await persistState(tasks)
+						stopRequestPollerIfIdle()
+						const out = await tailOfFile(task.outputFile, 16_000)
+						const body = out.text.trim()
+						return `${reason}\n${body ? `\nOutput so far:\n${body}` : "\n(no output)"}`
+					}
+
+					try {
+						while (task.status === "running") {
+							if (task.backgrounded) {
+								return [
+									`Command moved to background by the user (task ${task.id}, pid ${task.pid}).`,
+									`Output file: ${task.outputFile}`,
+									`Do not wait for it and do not poll: keep working. A message with the command's full result will be sent to you when it finishes.`,
+								].join("\n")
+							}
+							if (context.abort.aborted) {
+								task.stopRequested = true
+								await stopTask(task)
+								return await finishStopped("Command aborted by the user.")
+							}
+							if (args.timeout && args.timeout > 0 && Date.now() - startedAt > args.timeout) {
+								task.stopRequested = true
+								await stopTask(task)
+								return await finishStopped(`Command timed out after ${args.timeout}ms.`)
+							}
+							await new Promise((r) => setTimeout(r, 120))
+						}
+						// Completed while blocked: return the output directly.
+						const out = await tailOfFile(task.outputFile, 16_000)
+						const body = out.text.trim()
+						const code = task.exitCode
+						if (code === 0) return body || "(no output)"
+						return `Command failed with exit code ${code}.\n${body || "(no output)"}`
+					} finally {
+						context.abort.removeEventListener("abort", onAbort)
+					}
+				},
+			}),
+
 			bash_background: tool({
 				description:
 					"Run a shell command in the background without blocking. Returns a task ID and output file path immediately. " +
