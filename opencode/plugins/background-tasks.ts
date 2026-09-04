@@ -73,7 +73,9 @@ interface TaskSnapshot {
 }
 
 const STATE_FILE = join(OUTPUT_DIR, "state.json")
+const REQUESTS_FILE = join(OUTPUT_DIR, "requests.json")
 const SIDEBAR_FINISHED_LINGER_MS = 60_000 // finished tasks stay visible in the sidebar for this long
+const REQUEST_POLL_MS = 400 // how often stop requests from the TUI are processed
 
 function snapshot(t: BgTask): TaskSnapshot {
 	return {
@@ -213,6 +215,44 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 		}
 	}
 
+	let requestPoller: ReturnType<typeof setInterval> | undefined
+
+	function ensureRequestPoller() {
+		if (requestPoller) return
+		requestPoller = setInterval(() => {
+			// Process stop requests written by the TUI sidebar plugin.
+			void (async () => {
+				let ids: string[] = []
+				try {
+					const raw = JSON.parse(await readFile(REQUESTS_FILE, "utf8")) as { stop?: string[] }
+					ids = raw.stop ?? []
+				} catch {
+					return
+				}
+				if (ids.length === 0) return
+				try {
+					await writeFile(REQUESTS_FILE, JSON.stringify({ stop: [] }))
+				} catch {
+					// ignore
+				}
+				for (const id of ids) {
+					const task = tasks.get(id)
+					if (task && task.status === "running") {
+						void stopTask(task)
+					}
+				}
+			})()
+		}, REQUEST_POLL_MS)
+		requestPoller.unref?.()
+	}
+
+	function stopRequestPollerIfIdle() {
+		if (requestPoller && tasks.size === 0) {
+			clearInterval(requestPoller)
+			requestPoller = undefined
+		}
+	}
+
 	function startTask(command: string, description: string | undefined, timeoutMs: number | undefined, sessionID: string): BgTask {
 		const id = randomUUID().slice(0, 8)
 		const outputFile = join(OUTPUT_DIR, `${id}.log`)
@@ -240,6 +280,7 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			waiters: [],
 		}
 		tasks.set(id, task)
+		ensureRequestPoller()
 		void persistState(tasks)
 
 		let bytes = 0
@@ -278,6 +319,7 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			// Stopped tasks are removed entirely so they drop out of the UI.
 			if (task.status === "stopped") tasks.delete(task.id)
 			void persistState(tasks)
+			stopRequestPollerIfIdle()
 		})
 
 		child.on("error", (err) => {

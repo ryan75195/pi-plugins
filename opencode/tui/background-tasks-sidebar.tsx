@@ -18,8 +18,7 @@
 
 import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 import { createMemo, createSignal, For, onCleanup, Show } from "solid-js"
-import { execFile } from "node:child_process"
-import { readFile } from "node:fs/promises"
+import { readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -44,6 +43,7 @@ interface TaskSnapshot {
 }
 
 const STATE_FILE = join(tmpdir(), "opencode-background-tasks", "state.json")
+const REQUESTS_FILE = join(tmpdir(), "opencode-background-tasks", "requests.json")
 const POLL_MS = 700
 const TICK_MS = 1000
 const SIDEBAR_ORDER = 500
@@ -90,16 +90,20 @@ function pidAlive(pid: number | undefined): boolean {
 	}
 }
 
-function killTree(pid: number): void {
-	if (process.platform === "win32") {
-		execFile("taskkill", ["/pid", String(pid), "/T", "/F"], () => {})
-	} else {
-		try {
-			process.kill(pid, "SIGTERM")
-		} catch {
-			// already gone
-		}
+/**
+ * Ask the server plugin to stop a task via the requests file. Going through
+ * the server (instead of killing directly) marks the task as stopped so it
+ * is removed from the registry and drops out of the sidebar.
+ */
+async function requestStopTask(task: TaskSnapshot): Promise<void> {
+	let current: { stop?: string[] } = { stop: [] }
+	try {
+		current = JSON.parse(await readFile(REQUESTS_FILE, "utf8")) as { stop?: string[] }
+	} catch {
+		// no requests yet
 	}
+	const stop = new Set([...(current.stop ?? []), task.id])
+	await writeFile(REQUESTS_FILE, JSON.stringify({ stop: [...stop] }))
 }
 
 async function readTasks(): Promise<TaskSnapshot[]> {
@@ -151,8 +155,7 @@ const tui: TuiPlugin = async (api) => {
 			variant: "warning",
 			duration: 3000,
 		})
-		if (task.pid) killTree(task.pid)
-		poll()
+		void requestStopTask(task).then(() => poll())
 	}
 
 	// NOTE: triggered on mouse-UP, not mouse-down. On mouse-down the dialog
