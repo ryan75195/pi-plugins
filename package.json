@@ -1,0 +1,11 @@
+{
+  "name": "pi-plugins",
+  "version": "0.1.0",
+  "description": "Extensions, skills, prompts and themes for the pi coding agent",
+  "keywords": ["pi-package"],
+  "repository": "github:ryan75195/pi-plugins",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
