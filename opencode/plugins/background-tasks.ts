@@ -73,6 +73,7 @@ interface TaskSnapshot {
 }
 
 const STATE_FILE = join(OUTPUT_DIR, "state.json")
+const SIDEBAR_FINISHED_LINGER_MS = 60_000 // finished tasks stay visible in the sidebar for this long
 
 function snapshot(t: BgTask): TaskSnapshot {
 	return {
@@ -91,7 +92,12 @@ function snapshot(t: BgTask): TaskSnapshot {
 }
 
 async function persistState(tasks: Map<string, BgTask>) {
-	await persistStateMap(new Map([...tasks.values()].map((t) => [t.id, snapshot(t) as unknown as BgTask])))
+	// Sidebar state: running tasks always visible; finished tasks linger briefly.
+	const now = Date.now()
+	const visible = [...tasks.values()].filter(
+		(t) => t.status === "running" || !t.finishedAt || now - t.finishedAt < SIDEBAR_FINISHED_LINGER_MS,
+	)
+	await persistStateMap(new Map(visible.map((t) => [t.id, snapshot(t) as unknown as BgTask])))
 }
 
 async function persistStateMap(snapshots: Map<string, unknown>) {
@@ -269,6 +275,8 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			void notifyCompletion(task)
 			for (const w of task.waiters) w()
 			task.waiters = []
+			// Stopped tasks are removed entirely so they drop out of the UI.
+			if (task.status === "stopped") tasks.delete(task.id)
 			void persistState(tasks)
 		})
 

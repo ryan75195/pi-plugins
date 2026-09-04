@@ -1,15 +1,14 @@
 /**
  * background-tasks-sidebar — opencode TUI plugin
  *
- * Renders a "Background tasks" section in the TUI sidebar (the panel on the
- * right, toggled with ctrl+x b). Pairs with the server-side plugin
- * opencode/plugins/background-tasks.ts, which publishes task state to a JSON
- * file; this plugin polls it and renders live rows:
+ * Renders a collapsible "Background tasks" section in the TUI sidebar (the
+ * panel on the right, toggled with ctrl+x b). Pairs with the server-side
+ * plugin opencode/plugins/background-tasks.ts, which publishes task state to
+ * a JSON file; this plugin polls it and renders:
  *
- *   ▶ a1b2c3 npm run dev            1m12s
- *   ✔ e4f5a6 echo done              0.4s · exit 0
- *
- * Clicking a running row asks for confirmation and kills the process tree.
+ *   collapsed (default):  ⠼ Background tasks 1/2 ▸ dev server 1m12s
+ *   expanded:             full rows with elapsed time, exit codes, and
+ *                         click-to-stop (inline two-click confirm)
  *
  * Install: add the path to this file to the `plugin` array in
  * ~/.config/opencode/tui.json (or .opencode/tui.json):
@@ -23,10 +22,6 @@ import { execFile } from "node:child_process"
 import { readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-
-interface SlotContext {
-	theme: unknown
-}
 
 interface SlotProps {
 	session_id: string
@@ -52,6 +47,8 @@ const STATE_FILE = join(tmpdir(), "opencode-background-tasks", "state.json")
 const POLL_MS = 700
 const TICK_MS = 1000
 const SIDEBAR_ORDER = 500
+const CONFIRM_RESET_MS = 5000
+const MAX_LABEL_WIDTH = 48
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -78,6 +75,10 @@ function humanDuration(ms: number): string {
 	const m = Math.floor(ms / 60_000)
 	const s = Math.round((ms % 60_000) / 1000)
 	return `${m}m${s}s`
+}
+
+function truncate(text: string, max: number): string {
+	return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text
 }
 
 function pidAlive(pid: number | undefined): boolean {
@@ -114,6 +115,9 @@ async function readTasks(): Promise<TaskSnapshot[]> {
 const tui: TuiPlugin = async (api) => {
 	const [tasks, setTasks] = createSignal<TaskSnapshot[]>([])
 	const [now, setNow] = createSignal(Date.now())
+	const [expanded, setExpanded] = createSignal(false)
+	const [confirmingId, setConfirmingId] = createSignal<string | null>(null)
+	let confirmTimer: ReturnType<typeof setTimeout> | undefined
 
 	const poll = async () => {
 		setTasks(await readTasks())
@@ -125,9 +129,28 @@ const tui: TuiPlugin = async (api) => {
 	const stopPolling = () => {
 		clearInterval(pollTimer)
 		clearInterval(tickTimer)
+		if (confirmTimer) clearTimeout(confirmTimer)
 	}
 	api.lifecycle.onDispose(stopPolling)
 	onCleanup(stopPolling)
+
+	function armConfirm(id: string) {
+		setConfirmingId(id)
+		if (confirmTimer) clearTimeout(confirmTimer)
+		confirmTimer = setTimeout(() => setConfirmingId(null), CONFIRM_RESET_MS)
+	}
+
+	function stopTask(task: TaskSnapshot) {
+		setConfirmingId(null)
+		api.ui.toast({
+			title: "Stopping task",
+			message: `${task.id}: ${task.command}`,
+			variant: "warning",
+			duration: 3000,
+		})
+		if (task.pid) killTree(task.pid)
+		poll()
+	}
 
 	function colorFor(status: TaskStatus, alive = true): string {
 		if (status === "running" && !alive) return "textMuted"
@@ -143,85 +166,74 @@ const tui: TuiPlugin = async (api) => {
 		}
 	}
 
-	function requestStop(task: TaskSnapshot) {
-		api.ui.toast({
-			title: "Stopping task",
-			message: `${task.id}: ${task.command}`,
-			variant: "warning",
-			duration: 3000,
-		})
-		if (task.pid) killTree(task.pid)
-		poll()
+	function rowText(task: TaskSnapshot): string {
+		const alive = pidAlive(task.pid)
+		const icon = task.status === "running" && alive ? spinnerFrame() : statusIcon(task.status)
+		const elapsed = humanDuration((task.finishedAt ?? now()) - task.startedAt)
+		const right =
+			task.status === "running" ? (alive ? elapsed : `${elapsed} · gone`) : `${elapsed}${task.exitCode === null ? "" : ` · exit ${task.exitCode}`}`
+		const label = task.description ? `${task.description} (${task.command})` : task.command
+		return `${icon} ${task.id} ${truncate(label, MAX_LABEL_WIDTH)}  ${right}`
 	}
 
-	function confirmStop(task: TaskSnapshot) {
-		try {
-			api.ui.dialog.replace(() =>
-				api.ui.DialogConfirm({
-					title: "Stop background task",
-					message: `${task.id}: ${task.command}`,
-					onConfirm: () => {
-						api.ui.dialog.clear()
-						requestStop(task)
-					},
-					onCancel: () => api.ui.dialog.clear(),
-				}),
-			)
-		} catch {
-			requestStop(task)
-		}
+	function summaryLine(list: TaskSnapshot[]): string {
+		const runCount = list.filter((t) => t.status === "running").length
+		const head = `${runCount > 0 ? spinnerFrame() : statusIcon(list[0]!.status)} Background tasks ${runCount ? `${runCount} running` : `${list.length} finished`}`
+		const mostRelevant = list.find((t) => t.status === "running" && pidAlive(t.pid)) ?? list[0]!
+		const label = mostRelevant.description
+			? `${mostRelevant.description} (${mostRelevant.command})`
+			: mostRelevant.command
+		const elapsed = humanDuration((mostRelevant.finishedAt ?? now()) - mostRelevant.startedAt)
+		return `${head} ▸ ${truncate(label, MAX_LABEL_WIDTH)} ${elapsed}`
 	}
 
 	api.slots.register({
 		order: SIDEBAR_ORDER,
 		slots: {
-			sidebar_content(_ctx: SlotContext, props: SlotProps) {
-				const sessionTasks = createMemo(() =>
-					tasks().filter((t) => t.sessionID === props.session_id),
-				)
+			sidebar_content(_ctx: unknown, props: SlotProps) {
+				const sessionTasks = createMemo(() => tasks().filter((t) => t.sessionID === props.session_id))
 				return (
 					<Show when={sessionTasks().length > 0}>
 						<box>
-							<box flexDirection="row" gap={1}>
+							<box flexDirection="row" gap={1} onMouseDown={() => setExpanded((x) => !x)}>
 								<text fg={api.theme.current.primary}>
-									<b>{spinnerFrame()} Background tasks</b>
-								</text>
-								<text fg={api.theme.current.textMuted}>
-									{sessionTasks().filter((t) => t.status === "running").length}/{sessionTasks().length}
+									<b>{expanded() ? "▼" : "▸"} {summaryLine(sessionTasks())}</b>
 								</text>
 							</box>
-							<For each={sessionTasks()}>
-								{(task) => {
-									const alive = pidAlive(task.pid)
-									const icon = task.status === "running" && alive ? spinnerFrame() : statusIcon(task.status)
-									const elapsed = humanDuration(
-										(task.finishedAt ?? now()) - task.startedAt,
-									)
-									const right =
-										task.status === "running"
-											? alive
-												? elapsed
-												: `${elapsed} · gone`
-											: `${elapsed}${task.exitCode === null ? "" : ` · exit ${task.exitCode}`}`
-									const label = task.description
-										? `${task.description} (${task.command})`
-										: task.command
-									return (
-										<box
-											flexDirection="row"
-											justifyContent="space-between"
-											onMouseDown={() => {
-												if (task.status === "running" && alive) confirmStop(task)
-											}}
-										>
-											<text fg={colorFor(task.status, alive)}>
-												{icon} {task.id} {label}
-											</text>
-											<text fg={api.theme.current.textMuted}>{right}</text>
-										</box>
-									)
-								}}
-							</For>
+							<Show when={expanded()}>
+								<For each={sessionTasks()}>
+									{(task) => {
+										const alive = pidAlive(task.pid)
+										const running = task.status === "running" && alive
+										const color = colorFor(task.status, alive)
+										return (
+											<Show
+												when={running && confirmingId() === task.id}
+												fallback={
+													<box
+														flexDirection="row"
+														justifyContent="space-between"
+														onMouseDown={() => {
+															if (running) armConfirm(task.id)
+														}}
+													>
+														<text fg={color}>{rowText(task)}</text>
+													</box>
+												}
+											>
+												<box flexDirection="row" gap={2}>
+													<text fg={api.theme.current.error} attributes="bold" onMouseDown={() => stopTask(task)}>
+														[stop {task.id}]
+													</text>
+													<text fg={api.theme.current.textMuted} onMouseDown={() => setConfirmingId(null)}>
+														[keep]
+													</text>
+												</box>
+											</Show>
+										)
+									}}
+								</For>
+							</Show>
 						</box>
 					</Show>
 				)
