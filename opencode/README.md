@@ -28,7 +28,7 @@ session via `prompt_async`:
 - **Output**: streamed to `<tmpdir>/opencode-background-tasks/<task-id>.log` (readable with opencode's `read` tool). 50MB cap per task; further output discarded with a note in the file.
 - **Cleanup**: kill the process when stopping; Windows kills the whole process tree.
 - **Environment**: children receive `OPENCODE_BG_TASK_ID`.
-- No live task panel (opencode's TUI doesn't expose widget APIs to plugins) — the model-facing tools, notifications and toasts carry the workflow.
+- No live task panel in the chat area, BUT: a **TUI sidebar section** ([tui/background-tasks-sidebar.tsx](tui/background-tasks-sidebar.tsx)) renders running/finished tasks in the right-hand panel (`ctrl+x b`), with live elapsed times and click-to-stop (confirmation dialog). Pairs with the server plugin via a shared state file.
 - **`/processes` command** ([commands/processes.md](commands/processes.md), install to `~/.config/opencode/commands/`): appears in the TUI command menu. Shows a compact status table via `task_list`; supports `stop <id>`, `view <id>`, `stop all` arguments.
 
 ## Install
@@ -46,6 +46,24 @@ cp /path/to/pi-plugins/opencode/plugins/background-tasks.ts .opencode/plugins/
 ```
 
 No config needed — files in the plugin directory load automatically at startup.
+
+## Sidebar (TUI) install
+
+The sidebar plugin renders a live "Background tasks" section in opencode's right-hand panel:
+
+```bash
+# 1. Dependencies for the TUI plugin (solid-js + @opentui/solid)
+cd /path/to/pi-plugins/opencode/tui && npm install
+
+# 2. Register it in ~/.config/opencode/tui.json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["C:/absolute/path/to/pi-plugins/opencode/tui/background-tasks-sidebar.tsx"]
+}
+```
+
+Then open opencode, toggle the sidebar with `ctrl+x b`, and start a task with `bash_background` —
+it appears with a live spinner, elapsed time and exit code; click a running row to stop it.
 
 ## Example
 

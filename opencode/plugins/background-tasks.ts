@@ -23,7 +23,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { spawn, execSync, type ChildProcess } from "node:child_process"
 import { createWriteStream } from "node:fs"
-import { mkdir, open } from "node:fs/promises"
+import { mkdir, open, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
@@ -52,6 +52,55 @@ interface BgTask {
 	stopRequested: boolean
 	waiters: Array<() => void>
 	timeoutTimer?: ReturnType<typeof setTimeout>
+}
+
+/**
+ * Serialised task state shared with the TUI sidebar plugin
+ * (opencode/tui/background-tasks-sidebar.tsx) via a JSON file.
+ */
+interface TaskSnapshot {
+	id: string
+	sessionID: string
+	command: string
+	description?: string
+	pid: number | undefined
+	startedAt: number
+	finishedAt?: number
+	exitCode: number | null
+	status: TaskStatus
+	outputFile: string
+	truncated: boolean
+}
+
+const STATE_FILE = join(OUTPUT_DIR, "state.json")
+
+function snapshot(t: BgTask): TaskSnapshot {
+	return {
+		id: t.id,
+		sessionID: t.sessionID,
+		command: t.command,
+		description: t.description,
+		pid: t.pid,
+		startedAt: t.startedAt,
+		finishedAt: t.finishedAt,
+		exitCode: t.exitCode,
+		status: t.status,
+		outputFile: t.outputFile,
+		truncated: t.truncated,
+	}
+}
+
+async function persistState(tasks: Map<string, BgTask>) {
+	await persistStateMap(new Map([...tasks.values()].map((t) => [t.id, snapshot(t) as unknown as BgTask])))
+}
+
+async function persistStateMap(snapshots: Map<string, unknown>) {
+	try {
+		await mkdir(OUTPUT_DIR, { recursive: true })
+		await writeFile(STATE_FILE, JSON.stringify({ updatedAt: Date.now(), tasks: [...snapshots.values()] }))
+	} catch {
+		// Best-effort state sharing with the TUI; never fail task handling over it.
+	}
 }
 
 function humanDuration(ms: number): string {
@@ -185,6 +234,7 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			waiters: [],
 		}
 		tasks.set(id, task)
+		void persistState(tasks)
 
 		let bytes = 0
 		const out = createWriteStream(outputFile, { flags: "a" })
@@ -219,6 +269,7 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			void notifyCompletion(task)
 			for (const w of task.waiters) w()
 			task.waiters = []
+			void persistState(tasks)
 		})
 
 		child.on("error", (err) => {
@@ -231,6 +282,7 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 				void notifyCompletion(task)
 				for (const w of task.waiters) w()
 				task.waiters = []
+				void persistState(tasks)
 			}
 		})
 
@@ -271,6 +323,22 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 	}
 
 	return {
+		dispose: async () => {
+			// Stop our running tasks and drop our entries from the shared state
+			// file so the TUI sidebar doesn't show stale rows.
+			for (const t of running()) {
+				void stopTask(t)
+			}
+			const ourIds = new Set(tasks.keys())
+			tasks.clear()
+			try {
+				const raw = JSON.parse(await readFile(STATE_FILE, "utf8")) as { tasks?: TaskSnapshot[] }
+				await persistStateMap(new Map((raw.tasks ?? []).filter((t) => !ourIds.has(t.id)).map((t) => [t.id, { ...t } as unknown as BgTask])))
+			} catch {
+				await persistState(tasks)
+			}
+		},
+
 		event: async ({ event }) => {
 			if (event.type === "session.status") {
 				sessionBusy.set(event.properties.sessionID, event.properties.status.type !== "idle")

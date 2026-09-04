@@ -1,0 +1,13 @@
+{
+  "name": "pi-plugins-opencode-tui",
+  "private": true,
+  "dependencies": {
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@opentui/solid": "^0.5.10",
+    "@types/node": "^24",
+    "typescript": "^5"
+  }
+}
