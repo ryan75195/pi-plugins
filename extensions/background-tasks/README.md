@@ -19,7 +19,7 @@ its next turn — even if it already finished its previous response.
 ## Human-facing TUI
 
 - **Live task panel** below the editor while tasks exist: animated spinner, live elapsed time, right-aligned status/exit-code columns. Running tasks first; finished tasks linger ~60s then clear automatically.
-- **`/tasks` interactive manager** (TUI): pick a task → view its output in a scrollable overlay (`↑↓` scroll, `←→` page, `esc` close) or stop it; `esc` backs out. Non-TUI modes get a plain text listing.
+- **`/tasks` command or `alt+t`** — interactive manager (SelectList): pick a task → view its output in a scrollable overlay (`↑↓` scroll, `←→` page, `esc` close) or stop it; `esc` backs out. Non-TUI modes get a plain text listing.
 - Status-line entry showing running task count
 - Colored completion notifications (green = completed, yellow = stopped, red = failed)
 

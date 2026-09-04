@@ -597,53 +597,65 @@ export default function (pi: ExtensionAPI) {
 		}, { overlay: true });
 	}
 
-	pi.registerCommand("tasks", {
-		description: "Manage background tasks (view output, stop)",
-		handler: async (_args, ctx) => {
-			if (tasks.size === 0) {
+	async function openTaskManager(ctx: ExtensionContext): Promise<void> {
+		if (tasks.size === 0) {
+			ctx.ui.notify("No background tasks this session.", "info");
+			return;
+		}
+		if (ctx.mode !== "tui") {
+			// Non-interactive fallback: plain text listing.
+			const lines = [...tasks.values()].map((t) => formatTask(t));
+			ctx.ui.notify(lines.join("\n"), "info");
+			return;
+		}
+		for (;;) {
+			const list = sortedTasks();
+			if (list.length === 0) {
 				ctx.ui.notify("No background tasks this session.", "info");
 				return;
 			}
-			if (ctx.mode !== "tui") {
-				// Non-interactive fallback: plain text listing.
-				const lines = [...tasks.values()].map((t) => formatTask(t));
-				ctx.ui.notify(lines.join("\n"), "info");
-				return;
-			}
+			const items = list.map((t) => ({
+				value: t.id,
+				label: `${statusIcon(t.status)} ${t.id}  ${taskLabel(t)}`,
+				description: taskDescription(t),
+			}));
+			items.push({ value: "__close", label: "Close", description: "Exit the task manager" });
+			const picked = await taskPicker(ctx, "Background tasks", items);
+			if (!picked || picked === "__close") return;
+			const task = tasks.get(picked);
+			if (!task) continue;
 			for (;;) {
-				const list = sortedTasks();
-				if (list.length === 0) {
-					ctx.ui.notify("No background tasks this session.", "info");
-					return;
+				const actions: Array<{ value: string; label: string; description?: string }> = [
+					{ value: "view", label: "View output", description: `${task.outputFile}${task.truncated ? " (truncated at 50MB)" : ""}` },
+				];
+				if (task.status === "running") {
+					actions.push({ value: "stop", label: "Stop task", description: "Kill the process tree" });
 				}
-				const items = list.map((t) => ({
-					value: t.id,
-					label: `${statusIcon(t.status)} ${t.id}  ${taskLabel(t)}`,
-					description: taskDescription(t),
-				}));
-				items.push({ value: "__close", label: "Close", description: "Exit the task manager" });
-				const picked = await taskPicker(ctx, "Background tasks", items);
-				if (!picked || picked === "__close") return;
-				const task = tasks.get(picked);
-				if (!task) continue;
-				for (;;) {
-					const actions: Array<{ value: string; label: string; description?: string }> = [
-						{ value: "view", label: "View output", description: `${task.outputFile}${task.truncated ? " (truncated at 50MB)" : ""}` },
-					];
-					if (task.status === "running") {
-						actions.push({ value: "stop", label: "Stop task", description: "Kill the process tree" });
-					}
-					actions.push({ value: "back", label: "Back", description: "Return to the task list" });
-					const action = await taskPicker(ctx, `Task ${task.id} — ${task.status}`, actions);
-					if (!action || action === "back") break;
-					if (action === "view") {
-						await showOutputViewer(ctx, task);
-					} else if (action === "stop") {
-						void stopTask(task);
-						ctx.ui.notify(`Stopping ${task.id}…`, "info");
-					}
+				actions.push({ value: "back", label: "Back", description: "Return to the task list" });
+				const action = await taskPicker(ctx, `Task ${task.id} — ${task.status}`, actions);
+				if (!action || action === "back") break;
+				if (action === "view") {
+					await showOutputViewer(ctx, task);
+				} else if (action === "stop") {
+					void stopTask(task);
+					ctx.ui.notify(`Stopping ${task.id}…`, "info");
 				}
 			}
+		}
+	}
+
+	pi.registerCommand("tasks", {
+		description: "Manage background tasks (view output, stop)",
+		handler: async (_args, ctx) => {
+			await openTaskManager(ctx);
+		},
+	});
+
+	// Hotkey so the process manager is always one keystroke away.
+	pi.registerShortcut("alt+t", {
+		description: "Open background tasks manager",
+		handler: async (ctx) => {
+			await openTaskManager(ctx);
 		},
 	});
 

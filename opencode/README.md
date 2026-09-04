@@ -29,6 +29,7 @@ session via `prompt_async`:
 - **Cleanup**: kill the process when stopping; Windows kills the whole process tree.
 - **Environment**: children receive `OPENCODE_BG_TASK_ID`.
 - No live task panel (opencode's TUI doesn't expose widget APIs to plugins) — the model-facing tools, notifications and toasts carry the workflow.
+- **`/processes` command** ([commands/processes.md](commands/processes.md), install to `~/.config/opencode/commands/`): appears in the TUI command menu. Shows a compact status table via `task_list`; supports `stop <id>`, `view <id>`, `stop all` arguments.
 
 ## Install
 
