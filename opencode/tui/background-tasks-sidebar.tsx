@@ -180,8 +180,7 @@ const tui: TuiPlugin = async (api) => {
 
 	function summaryLine(list: TaskSnapshot[]): string {
 		const runCount = list.filter((t) => t.status === "running" && pidAlive(t.pid)).length
-		const icon = runCount > 0 ? spinnerFrame() : statusIcon(list[0]!.status)
-		return `${icon} Background tasks · ${runCount} running · ${list.length} total`
+		return runCount > 0 ? `Background tasks · ${runCount} running` : `Background tasks · idle`
 	}
 
 	function rowText(task: TaskSnapshot): string {
