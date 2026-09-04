@@ -74,6 +74,8 @@ interface TaskSnapshot {
 	status: TaskStatus
 	outputFile: string
 	truncated: boolean
+	foreground?: boolean
+	backgrounded?: boolean
 }
 
 const STATE_FILE = join(OUTPUT_DIR, "state.json")
@@ -94,6 +96,8 @@ function snapshot(t: BgTask): TaskSnapshot {
 		status: t.status,
 		outputFile: t.outputFile,
 		truncated: t.truncated,
+		foreground: t.foreground,
+		backgrounded: t.backgrounded,
 	}
 }
 
