@@ -70,20 +70,36 @@ function loadPersisted(): (RemoteState & { stoppedAt?: never }) | { stoppedAt: n
   }
 }
 
+const TAILSCALE_CANDIDATES = process.platform === "win32"
+  ? ["tailscale", "tailscale.exe", "C:\\Program Files\\Tailscale\\tailscale.exe"]
+  : ["tailscale"]
+
 function tailscale(args: string[]): { ok: boolean; out: string } {
-  const r = spawnSync("tailscale", args, { encoding: "utf8", timeout: 20_000 })
-  return { ok: r.status === 0, out: `${r.stdout ?? ""}\n${r.stderr ?? ""}`.trim() }
+  let last = ""
+  for (const cmd of TAILSCALE_CANDIDATES) {
+    const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 20_000, windowsHide: true })
+    if (!r.error && r.status === 0) return { ok: true, out: (r.stdout ?? "").trim() }
+    last = [r.error?.message, r.stderr, r.stdout].filter(Boolean).join("\n").trim()
+    // Spawn failed to find this candidate (ENOENT) -> try the next one.
+    // Otherwise the CLI itself reported an error -> report it as-is.
+    const enoent = (r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+    if (!enoent) break
+  }
+  return { ok: false, out: last || "tailscale command not found on PATH" }
 }
 
 function machineHost(): string | undefined {
-  const r = spawnSync("tailscale", ["status", "--json"], { encoding: "utf8", timeout: 20_000 })
-  if (r.status !== 0) return undefined
-  try {
-    const dns = (JSON.parse(r.stdout) as { Self?: { DNSName?: string } }).Self?.DNSName
-    return dns ? dns.replace(/\.$/, "") : undefined
-  } catch {
-    return undefined
+  for (const cmd of TAILSCALE_CANDIDATES) {
+    const r = spawnSync(cmd, ["status", "--json"], { encoding: "utf8", timeout: 20_000, windowsHide: true })
+    if (r.error || r.status !== 0) continue
+    try {
+      const dns = (JSON.parse(r.stdout) as { Self?: { DNSName?: string } }).Self?.DNSName
+      if (dns) return dns.replace(/\.$/, "")
+    } catch {
+      /* try next candidate */
+    }
   }
+  return undefined
 }
 
 function freePort(): number {
