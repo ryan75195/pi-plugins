@@ -53,6 +53,7 @@ type MessageRow = {
 }
 
 let server: ReturnType<typeof Bun.serve> | undefined
+let startedHere = false // this process actually published the tailscale serve entry
 let eventLog: Array<{ type: string; sessionID?: string }> = []
 const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>()
 
@@ -343,6 +344,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     }
     state.url = `https://${host}/?t=${tok}`
     persist(state)
+    startedHere = true
     return [
       "Remote Control is ON for this session.",
       `Open from any device on your tailnet: ${state.url}`,
@@ -364,6 +366,8 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       }
     }
     sseClients.clear()
+    if (!startedHere) return "Remote Control was not active in this process."
+    startedHere = false
     persist({ stoppedAt: Date.now() })
     const r = tailscale(["serve", "reset"])
     return r.ok ? "Remote Control off. Local session unaffected." : `Remote Control off, but tailscale serve reset failed: ${r.out}`
