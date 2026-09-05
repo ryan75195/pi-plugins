@@ -71,3 +71,28 @@ Ask opencode:
 
 > Start `npm run dev` in the background, then keep working. When it's ready,
 > curl the server to verify it responds, then stop the task.
+
+## Remote Control (opencode, over Tailscale)
+
+Claude Code `/remote-control` parity: register the current session and continue
+it from a phone, tablet, or any browser on your tailnet. The session keeps
+running locally; the remote client is a window into it.
+
+- `opencode/plugins/remote-control.ts` — plugin; hosts a localhost-only
+  endpoint inside the opencode server process (Bun.serve) and publishes it via
+  `tailscale serve --bg` (tailnet-only, never public; token-gated on top).
+- `opencode/commands/remote-control.md` — `/remote-control [name]`, `off`, `status`.
+
+Setup: enable Tailscale Serve once (the plugin prints the enable link if it is
+not on). Requires `tailscale` on PATH. Install = copy both files as with the
+other plugins/commands.
+
+Architecture:
+
+```
+browser on tailnet ──https://<host>.ts.net/?t=<token>──► tailscale serve ──►
+127.0.0.1:<port> Bun.serve (plugin) ── SDK ──► session (promptAsync/messages)
+```
+
+The web client lists sessions, streams the transcript, opens new sessions, and
+queues messages mid-turn (delivered after the current turn, like Claude Code).

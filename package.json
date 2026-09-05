@@ -6,7 +6,7 @@
   "repository": "github:ryan75195/pi-plugins",
   "license": "MIT",
   "scripts": {
-    "typecheck": "tsc --noEmit --strict --target esnext --module esnext --moduleResolution bundler --skipLibCheck opencode/plugins/background-tasks.ts extensions/background-tasks/index.ts"
+    "typecheck": "tsc --noEmit --strict --target esnext --module esnext --moduleResolution bundler --skipLibCheck opencode/plugins/background-tasks.ts opencode/plugins/remote-control.ts extensions/background-tasks/index.ts"
   },
   "devDependencies": {
     "@types/node": "^24",
