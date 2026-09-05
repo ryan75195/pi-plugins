@@ -357,12 +357,13 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     tool: {
       remote_control: tool({
         description:
-          "Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet. Actions: 'on' registers and prints the URL, 'off' unregisters, 'status' reports state.",
+          "Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet. Actions: 'toggle' turns it off if it is on, on if it is off — use this for a bare /remote-control. 'on' forces registration, 'off' unregisters, 'status' reports state.",
         args: {
-          action: tool.schema.enum(["on", "off", "status"]).describe("on = register, off = unregister, status = report"),
+          action: tool.schema.enum(["toggle", "on", "off", "status"]).describe("toggle = flip on/off (default for /remote-control), on = register, off = unregister, status = report"),
           name: tool.schema.string().optional().describe("optional display name shown in the remote session list"),
         },
         async execute(args, context) {
+          if (args.action === "toggle") return server ? stop() : start(args.name || undefined, context.sessionID)
           if (args.action === "off") return stop()
           if (args.action === "status") {
             const st = loadPersisted()
