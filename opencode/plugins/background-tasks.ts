@@ -102,11 +102,15 @@ function snapshot(t: BgTask): TaskSnapshot {
 }
 
 async function persistState(tasks: Map<string, BgTask>) {
-	// Sidebar state: running tasks always visible; finished tasks linger briefly.
+	// Sidebar state: only explicitly-background tasks (and foreground ones the
+	// user moved to the background with ctrl+b). Blocking foreground commands
+	// stay off the sidebar until they are backgrounded or finish; finished
+	// background tasks linger briefly.
 	const now = Date.now()
-	const visible = [...tasks.values()].filter(
-		(t) => t.status === "running" || !t.finishedAt || now - t.finishedAt < SIDEBAR_FINISHED_LINGER_MS,
-	)
+	const visible = [...tasks.values()].filter((t) => {
+		if (t.foreground && !t.backgrounded) return false
+		return t.status === "running" || !t.finishedAt || now - t.finishedAt < SIDEBAR_FINISHED_LINGER_MS
+	})
 	await persistStateMap(new Map(visible.map((t) => [t.id, snapshot(t) as unknown as BgTask])))
 }
 
