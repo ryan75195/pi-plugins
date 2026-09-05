@@ -268,7 +268,13 @@ const tui: TuiPlugin = async (api) => {
 				)
 			},
 			sidebar_content(_ctx: unknown, props: SlotProps) {
-				const sessionTasks = createMemo(() => tasks().filter((t) => t.sessionID === props.session_id))
+				const sessionTasks = createMemo(() =>
+					tasks().filter(
+						// Mirror the server-side filter so stale state written by an
+						// older plugin process can't leak foreground rows in here.
+						(t) => !(t.foreground && !t.backgrounded) && t.sessionID === props.session_id,
+					),
+				)
 				return (
 					<Show when={sessionTasks().length > 0}>
 						<box>
