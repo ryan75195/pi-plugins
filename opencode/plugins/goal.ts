@@ -38,6 +38,7 @@ const MAX_CONDITION_CHARS = 4000
 const MAX_TRANSCRIPT_CHARS = 10_000
 const MAX_NO_TOOL_STREAK = 3
 const MAX_IDLE_DEFERRALS = 3
+const MAX_TURNS = 40 // hard cap: a goal that never resolves stops after this many evaluated turns
 
 type GoalStatus = "active" | "achieved" | "failed" | "paused"
 
@@ -207,7 +208,14 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 					if (await lastTurnHadNoTools(sessionID)) goal.noToolStreak += 1
 					else goal.noToolStreak = 0
 
-					if (goal.noToolStreak >= MAX_NO_TOOL_STREAK) {
+					if (goal.turns >= MAX_TURNS) {
+						goal.status = "failed"
+						goal.endedAt = Date.now()
+						await deliver(
+							sessionID,
+							`◎ Goal stopped after ${MAX_TURNS} turns without the condition being met — cleared to avoid burning tokens.\nCondition: ${goal.condition}\nLast evaluation: ${verdict.reason}\nSet a narrower goal or continue manually.`,
+						)
+					} else if (goal.noToolStreak >= MAX_NO_TOOL_STREAK) {
 						goal.status = "paused"
 						await deliver(
 							sessionID,
