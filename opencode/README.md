@@ -47,6 +47,18 @@ cp /path/to/pi-plugins/opencode/plugins/background-tasks.ts .opencode/plugins/
 
 No config needed — files in the plugin directory load automatically at startup.
 
+### Global agent policy (AGENTS.md)
+
+`AGENTS.md` in this directory tells every opencode session to reach for
+`monitor` instead of sleep/poll loops and to prefer `bash_background` for
+long-running processes. Install it globally with the rest:
+
+```bash
+cp /path/to/pi-plugins/opencode/AGENTS.md ~/.config/opencode/AGENTS.md
+```
+
+(Existing global AGENTS.md: merge the two sections instead of overwriting.)
+
 ## Sidebar (TUI) install
 
 The sidebar plugin renders a live "Background tasks" section in opencode's right-hand panel:
