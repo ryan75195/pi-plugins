@@ -16,6 +16,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { spawn, type ChildProcess } from "node:child_process"
+import { readFile, writeFile } from "node:fs/promises"
 import { createInterface } from "node:readline"
 import { lookup } from "node:dns/promises"
 import { isIP } from "node:net"
@@ -33,6 +34,11 @@ declare const WebSocket: {
 
 const STATE_DIR = join(process.env.TEMP ?? "/tmp", "opencode-monitor")
 const STATE_FILE = join(STATE_DIR, "state.json")
+// Shared task registry with the background-tasks plugin + its TUI sidebar:
+// monitors appear as rows there and can be stopped from it.
+const BG_DIR = join(process.env.TEMP ?? "/tmp", "opencode-background-tasks")
+const BG_STATE_FILE = join(BG_DIR, "state.json")
+const BG_REQUESTS_FILE = join(BG_DIR, "requests.json")
 
 const DEFAULT_TIMEOUT_MS = 15 * 60_000
 const FLUSH_INTERVAL_MS = 1200 // coalesce rapid lines into one event
@@ -50,6 +56,7 @@ type Watch = {
   target: string
   pattern?: RegExp
   startedAt: number
+  endedAt?: number
   timeoutAt: number // Infinity when persistent
   events: number
   buffered: string[]
@@ -83,6 +90,48 @@ function persist(watches: Map<string, Watch>) {
 
 function clip(line: string): string {
   return line.length > MAX_LINE_CHARS ? line.slice(0, MAX_LINE_CHARS) + "…" : line
+}
+
+/** Merge one watch into the shared task registry (never clobbers other rows). */
+async function publishSnapshot(w: Watch) {
+  const row = {
+    id: w.id,
+    sessionID: w.sessionID,
+    command: w.target,
+    description: `[monitor] ${w.description}`,
+    pid: w.proc?.pid,
+    startedAt: w.startedAt,
+    finishedAt: w.ended ? Date.now() : undefined,
+    exitCode: null,
+    status: w.ended ? "stopped" : "running",
+    outputFile: "",
+    truncated: false,
+    monitor: true,
+  }
+  try {
+    let tasks: Array<Record<string, unknown>> = []
+    try {
+      const raw = JSON.parse(await readFile(BG_STATE_FILE, "utf8")) as { tasks?: Array<Record<string, unknown>> }
+      tasks = (raw.tasks ?? []).filter((t) => t.id !== w.id)
+    } catch {
+      /* no registry yet */
+    }
+    if (!w.ended || w.events >= 0) tasks.push(row) // always publish; sidebar prunes ended rows itself    mkdirSync(BG_DIR, { recursive: true })
+    writeFileSync(BG_STATE_FILE, JSON.stringify({ updatedAt: Date.now(), tasks }))
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Remove our ended rows from the shared registry after a linger period. */
+async function pruneSnapshot(id: string) {
+  try {
+    const raw = JSON.parse(await readFile(BG_STATE_FILE, "utf8")) as { tasks?: Array<Record<string, unknown>> }
+    const tasks = (raw.tasks ?? []).filter((t) => t.id !== id)
+    writeFileSync(BG_STATE_FILE, JSON.stringify({ updatedAt: Date.now(), tasks }))
+  } catch {
+    /* nothing to prune */
+  }
 }
 
 /** Claude Code parity: deny URLs pointing at private, link-local, or metadata addresses. */
@@ -136,6 +185,7 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
   function end(w: Watch, reason: string) {
     if (w.ended) return
     w.ended = true
+    w.endedAt = Date.now()
     if (w.flushTimer) clearTimeout(w.flushTimer)
     if (w.proc?.pid) {
       try {
@@ -152,6 +202,8 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
     }
     watches.delete(w.id)
     persist(watches)
+    void publishSnapshot(w)
+    setTimeout(() => void pruneSnapshot(w.id), 60_000).unref?.()
     void deliver(
       w,
       w.buffered.length
@@ -293,6 +345,7 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
 
     watches.set(id, w)
     persist(watches)
+    void publishSnapshot(w)
 
     if (timeout !== Infinity) {
       setTimeout(() => end(w, "timeout reached"), timeout).unref?.()
@@ -312,6 +365,38 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
     end(w, "stopped by monitor_stop")
     return `stopped ${id}`
   }
+
+  // Consume stop requests from the shared requests file that target OUR watch
+  // ids, leaving entries owned by other plugins (e.g. background tasks).
+  let requestPoller: ReturnType<typeof setInterval> | undefined
+  function ensureRequestPoller() {
+    if (requestPoller) return
+    requestPoller = setInterval(() => {
+      void (async () => {
+        let stop: string[] = []
+        try {
+          const raw = JSON.parse(await readFile(BG_REQUESTS_FILE, "utf8")) as { stop?: string[] }
+          stop = raw.stop ?? []
+        } catch {
+          return
+        }
+        const mine = stop.filter((id) => watches.has(id))
+        if (mine.length === 0) return
+        try {
+          const raw = JSON.parse(await readFile(BG_REQUESTS_FILE, "utf8")) as { stop?: string[]; backgroundSessions?: string[] }
+          await writeFile(
+            BG_REQUESTS_FILE,
+            JSON.stringify({ stop: (raw.stop ?? []).filter((id) => !watches.has(id)), backgroundSessions: raw.backgroundSessions ?? [] }),
+          )
+        } catch {
+          /* racing writer — worst case the stop is processed twice, which is harmless */
+        }
+        for (const id of mine) stopOne(id)
+      })()
+    }, 1000)
+    requestPoller.unref?.()
+  }
+  ensureRequestPoller()
 
   return {
     tool: {
@@ -357,6 +442,7 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
       }
     },
     async dispose() {
+      if (requestPoller) clearInterval(requestPoller)
       for (const w of [...watches.values()]) end(w, "session ended")
     },
   }

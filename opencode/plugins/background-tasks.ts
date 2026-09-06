@@ -247,12 +247,17 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 					return
 				}
 				if (ids.length === 0 && backgroundSessions.length === 0) return
+				// Consume only OUR stop ids; leave foreign ones (e.g. monitor watch
+				// ids) for whichever plugin owns them.
+				const mine = ids.filter((id) => tasks.has(id))
+				const theirs = ids.filter((id) => !tasks.has(id))
+				if (mine.length === 0 && backgroundSessions.length === 0) return
 				try {
-					await writeFile(REQUESTS_FILE, JSON.stringify({ stop: [] }))
+					await writeFile(REQUESTS_FILE, JSON.stringify({ stop: theirs, backgroundSessions: [] }))
 				} catch {
 					// ignore
 				}
-				for (const id of ids) {
+				for (const id of mine) {
 					const task = tasks.get(id)
 					if (task && task.status === "running") {
 						void stopTask(task)
