@@ -22,7 +22,7 @@ import { tool } from "@opencode-ai/plugin"
 import { createHash, randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { homedir, hostname } from "node:os"
 import { connect } from "node:net"
 
@@ -773,7 +773,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       token: tok,
       port,
       mount,
-      name: name ?? `opencode on ${machineName()}`,
+      name: name ?? `${basename(directory) || "opencode"} on ${machineName()}`,
       directory,
       host: "",
       defaultSession: sessionID,
