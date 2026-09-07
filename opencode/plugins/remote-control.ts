@@ -142,6 +142,28 @@ async function pruneStale(): Promise<void> {
   if (alive.length !== regs.length) persistRegistrations(alive)
 }
 
+/**
+ * The tailnet root is a single contested resource: a path-less
+ * `serve --bg <port>` silently REPLACES any existing root handler, which
+ * would steal another instance's published URL. Only claim the root when
+ * nothing publishes it yet; otherwise publish under our unique mount.
+ */
+function rootMountFree(): boolean {
+  const status = tailscale(["serve", "status", "--json"])
+  if (!status.ok) return false
+  try {
+    const parsed = JSON.parse(status.out) as {
+      Web?: Record<string, { Handlers?: Record<string, unknown> }>
+    }
+    for (const host of Object.values(parsed.Web ?? {})) {
+      if (host.Handlers?.["/"] !== undefined) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
 const TAILSCALE_CANDIDATES = process.platform === "win32"
   ? ["tailscale", "tailscale.exe", "C:\\Program Files\\Tailscale\\tailscale.exe"]
   : ["tailscale"]
@@ -508,12 +530,16 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
 
     server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler })
 
-    // First choice: own the tailnet root. If another instance (or anything
-    // else) already publishes "/", mount under a unique path instead —
-    // multiple instances can then be remote-controlled at once.
-    let serve = tailscale(["serve", "--bg", String(port)])
-    let path = ""
-    if (!serve.ok) {
+    // First choice: own the tailnet root, but only when nothing already
+    // publishes it — a path-less serve would silently replace another
+    // instance's handler. Otherwise (or if the root claim fails) mount under
+    // a unique path so every instance keeps a working URL.
+    const claimRoot = rootMountFree()
+    let serve = claimRoot
+      ? tailscale(["serve", "--bg", String(port)])
+      : tailscale(["serve", "--bg", "--set-path", mount, String(port)])
+    let path = claimRoot ? "" : mount
+    if (!serve.ok && claimRoot) {
       serve = tailscale(["serve", "--bg", "--set-path", mount, String(port)])
       path = mount
     }
