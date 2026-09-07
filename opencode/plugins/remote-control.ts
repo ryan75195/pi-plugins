@@ -45,6 +45,7 @@ type RemoteState = {
   name: string
   defaultSession: string
   startedAt: number
+  pid: number
 }
 
 type SessionRow = { id: string; title?: string; updatedAt?: number }
@@ -55,20 +56,32 @@ type MessageRow = {
 
 let server: ReturnType<typeof Bun.serve> | undefined
 let startedHere = false // this process actually published the tailscale serve entry
+let activeState: RemoteState | undefined // this process's registration (in-memory truth)
 let eventLog: Array<{ type: string; sessionID?: string }> = []
 const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>()
 
-function persist(state: RemoteState | { stoppedAt: number }) {
+/**
+ * Registrations are stored per machine as a LIST keyed by process pid —
+ * multiple opencode instances can be remote-controlled simultaneously, and
+ * each instance may only modify its own entry. The mount used for a stop is
+ * taken from memory (the starting process knows it); the file is advisory,
+ * for `status` and cross-instance visibility.
+ */
+function persistRegistrations(regs: RemoteState[]) {
   mkdirSync(STATE_DIR, { recursive: true })
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2))
+  writeFileSync(STATE_FILE, JSON.stringify({ updatedAt: Date.now(), registrations: regs }, null, 2))
 }
 
-function loadPersisted(): (RemoteState & { stoppedAt?: never }) | { stoppedAt: number } | undefined {
+function loadRegistrations(): RemoteState[] {
   try {
-    if (!existsSync(STATE_FILE)) return undefined
-    return JSON.parse(readFileSync(STATE_FILE, "utf8"))
+    if (!existsSync(STATE_FILE)) return []
+    const raw = JSON.parse(readFileSync(STATE_FILE, "utf8"))
+    if (Array.isArray(raw?.registrations)) return raw.registrations as RemoteState[]
+    // legacy single-registration shape
+    if (raw?.url && raw?.token) return [raw as RemoteState]
+    return []
   } catch {
-    return undefined
+    return []
   }
 }
 
@@ -311,9 +324,8 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
   }
 
   async function start(name: string | undefined, sessionID: string): Promise<string> {
-    if (server) {
-      const prev = loadPersisted()
-      return `Remote Control already active.\nURL: ${(prev as RemoteState | undefined)?.url ?? "(unknown)"}`
+    if (server && activeState) {
+      return `Remote Control already active in this process.\nURL: ${activeState.url}`
     }
     const tok = randomBytes(16).toString("hex")
     const port = freePort()
@@ -326,6 +338,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       name: name ?? `opencode on ${machineHost()?.split(".")[0] ?? "host"}`,
       defaultSession: sessionID,
       startedAt: Date.now(),
+      pid: process.pid,
     }
     const handler = makeHandler(tok, () => state)
 
@@ -357,7 +370,10 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       return "could not read tailnet hostname (tailscale status failed)"
     }
     state.url = `https://${host}${path}/?t=${tok}`
-    persist(state)
+    activeState = state
+    const regs = loadRegistrations().filter((r) => r.pid !== process.pid)
+    regs.push(state)
+    persistRegistrations(regs)
     startedHere = true
     return [
       "Remote Control is ON for this session.",
@@ -382,9 +398,10 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     sseClients.clear()
     if (!startedHere) return "Remote Control was not active in this process."
     startedHere = false
-    const prev = loadPersisted()
-    const mount = prev && !("stoppedAt" in prev) ? prev.mount : "/"
-    persist({ stoppedAt: Date.now() })
+    // Our mount is known in memory — never trust the shared file for this.
+    const mount = activeState?.mount ?? "/"
+    activeState = undefined
+    persistRegistrations(loadRegistrations().filter((r) => r.pid !== process.pid))
     // Targeted removal of OUR mount only — never reset other instances' mounts.
     let r = tailscale(["serve", "--set-path", mount, "off"])
     if (!r.ok && mount === "/") r = tailscale(["serve", "reset"])
@@ -404,14 +421,16 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
           if (args.action === "toggle") return server ? stop() : start(args.name || undefined, context.sessionID)
           if (args.action === "off") return stop()
           if (args.action === "status") {
-            const st = loadPersisted()
-            if (!server || !st || "stoppedAt" in st) return "Remote Control: not active. Run /remote-control to register this session."
-            return [
-              `Remote Control: active since ${new Date(st.startedAt).toLocaleString()}`,
-              `URL: ${st.url}`,
-              `Name: ${st.name}`,
-              `Default session: ${st.defaultSession}`,
-            ].join("\n")
+            const regs = loadRegistrations()
+            if (regs.length === 0) return "Remote Control: not active. Run /remote-control to register this session."
+            const lines: string[] = []
+            for (const r of regs) {
+              const mine = r.pid === process.pid ? " (this process)" : ""
+              lines.push(
+                `${r.name}${mine} — active since ${new Date(r.startedAt).toLocaleTimeString()}\n  URL: ${r.url}\n  Default session: ${r.defaultSession}`,
+              )
+            }
+            return `Remote Control: ${regs.length} active registration(s)\n${lines.join("\n")}`
           }
           return start(args.name || undefined, context.sessionID)
         },
