@@ -16,9 +16,12 @@ ln -s /path/to/pi-plugins/extensions/background-tasks ~/.pi/agent/extensions/bac
 ## Install (opencode)
 
 ```bash
-mkdir -p ~/.config/opencode/plugins
-ln -s /path/to/pi-plugins/opencode/plugins/background-tasks.ts ~/.config/opencode/plugins/background-tasks.ts
+npm run install:opencode
 ```
+
+Copies every plugin in `opencode/plugins/` and every command in
+`opencode/commands/` into `~/.config/opencode/`. They are copies, so re-run it
+after each merge and restart running opencode instances.
 
 ## Extensions
 
