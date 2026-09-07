@@ -95,6 +95,8 @@ running locally; the remote client is a window into it.
   `tailscale serve --bg` (tailnet-only, never public; token-gated on top).
 - `opencode/commands/remote-control.md` — `/remote-control [name]`, `off`, `status`.
 
+Every instance publishes under its own stable `/rc-<instance id>` path; the tailnet root is never claimed, so instances cannot replace each other's URL. Diagnostics: `%TEMP%\opencode-remoteemote-control.log` records every tailscale call and registration decision.
+
 Setup: enable Tailscale Serve once (the plugin prints the enable link if it is
 not on). Requires `tailscale` on PATH. Install with `npm run install:opencode`
 (see below).
@@ -102,7 +104,7 @@ not on). Requires `tailscale` on PATH. Install with `npm run install:opencode`
 Architecture:
 
 ```
-browser on tailnet ──https://<host>.ts.net/?t=<token>──► tailscale serve ──►
+browser on tailnet ──https://<host>.ts.net/rc-<id>/?t=<token>──► tailscale serve ──►
 127.0.0.1:<port> Bun.serve (plugin) ── SDK ──► session (promptAsync/messages)
 ```
 
