@@ -21,6 +21,7 @@ import { randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { connect } from "node:net"
 
 // opencode runs on Bun, so this global exists at runtime. Minimal ambient decl
 // keeps TS happy without @types/bun.
@@ -83,6 +84,62 @@ function loadRegistrations(): RemoteState[] {
   } catch {
     return []
   }
+}
+
+function portAlive(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = connect({ host: "127.0.0.1", port })
+    const done = (ok: boolean) => {
+      sock.destroy()
+      resolve(ok)
+    }
+    sock.setTimeout(1500)
+    sock.once("connect", () => done(true))
+    sock.once("timeout", () => done(false))
+    sock.once("error", () => done(false))
+  })
+}
+
+function pidAlive(pid: number): boolean {
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Self-healing for crashed processes (dispose never ran): drop /rc-* tailscale
+ * mounts whose backing port is dead, and registrations whose pid is gone.
+ * Only touches our own mount namespace - never foreign handlers.
+ */
+async function pruneStale(): Promise<void> {
+  // 1. Dead /rc-* mounts.
+  const status = tailscale(["serve", "status", "--json"])
+  if (status.ok) {
+    try {
+      const parsed = JSON.parse(status.out) as {
+        Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }>
+      }
+      const mounts: string[] = []
+      for (const host of Object.values(parsed.Web ?? {})) {
+        for (const [mount, handler] of Object.entries(host.Handlers ?? {})) {
+          if (!mount.startsWith("/rc-")) continue
+          const port = Number(handler.Proxy?.match(/:(\d+)$/)?.[1])
+          if (!port || !(await portAlive(port))) mounts.push(mount)
+        }
+      }
+      for (const mount of mounts) void tailscale(["serve", "--set-path", mount, "off"])
+    } catch {
+      /* status format drift - skip pruning rather than guess */
+    }
+  }
+  // 2. Dead-pid registrations.
+  const regs = loadRegistrations()
+  const alive = regs.filter((r) => pidAlive(r.pid))
+  if (alive.length !== regs.length) persistRegistrations(alive)
 }
 
 const TAILSCALE_CANDIDATES = process.platform === "win32"
@@ -327,6 +384,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     if (server && activeState) {
       return `Remote Control already active in this process.\nURL: ${activeState.url}`
     }
+    await pruneStale()
     const tok = randomBytes(16).toString("hex")
     const port = freePort()
     const mount = `/rc-${randomBytes(3).toString("hex")}`
