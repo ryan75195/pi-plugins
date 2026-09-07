@@ -227,10 +227,33 @@ const TAILSCALE_CANDIDATES = process.platform === "win32"
   ? ["tailscale", "tailscale.exe", "C:\\Program Files\\Tailscale\\tailscale.exe"]
   : ["tailscale"]
 
+const SPAWN_TIMEOUT_MS = 20_000
+// Bun measures spawnSync's timeout against a clock that goes stale while the
+// process idles: after an idle stretch longer than the timeout, the FIRST
+// spawnSync comes back with ETIMEDOUT within milliseconds, the child never
+// having run. That call refreshes the clock, so the next one works. A genuine
+// timeout takes the full SPAWN_TIMEOUT_MS, so an ETIMEDOUT that returns almost
+// instantly is the Bun artefact and is worth retrying.
+// This is what left orphaned mounts behind: stop() is usually the first
+// tailscale call after a long idle, and it only ever made one.
+const SPURIOUS_TIMEOUT_MS = 1_000
+const SPAWN_ATTEMPTS = 3
+
+function spawnTailscale(cmd: string, args: string[]) {
+  for (let attempt = 1; ; attempt++) {
+    const startedAt = Date.now()
+    const r = spawnSync(cmd, args, { encoding: "utf8", timeout: SPAWN_TIMEOUT_MS, windowsHide: true })
+    const spurious =
+      (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" &&
+      Date.now() - startedAt < SPURIOUS_TIMEOUT_MS
+    if (!spurious || attempt >= SPAWN_ATTEMPTS) return r
+  }
+}
+
 function tailscale(args: string[]): { ok: boolean; out: string } {
   let last = ""
   for (const cmd of TAILSCALE_CANDIDATES) {
-    const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 20_000, windowsHide: true })
+    const r = spawnTailscale(cmd, args)
     if (!r.error && r.status === 0) return { ok: true, out: (r.stdout ?? "").trim() }
     last = [r.error?.message, r.stderr, r.stdout].filter(Boolean).join("\n").trim()
     // Spawn failed to find this candidate (ENOENT) -> try the next one.
@@ -249,7 +272,7 @@ let cachedHost: string | undefined
 function machineHost(): string | undefined {
   if (cachedHost) return cachedHost
   for (const cmd of TAILSCALE_CANDIDATES) {
-    const r = spawnSync(cmd, ["status", "--json"], { encoding: "utf8", timeout: 20_000, windowsHide: true })
+    const r = spawnTailscale(cmd, ["status", "--json"])
     if (r.error || r.status !== 0) continue
     try {
       const dns = (JSON.parse(r.stdout) as { Self?: { DNSName?: string } }).Self?.DNSName
