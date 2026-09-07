@@ -71,6 +71,40 @@ type MessageRow = {
   info: { role: string }
   parts: Array<{ type: string; text?: string; tool?: string; state?: { status?: string; output?: string } }>
 }
+type PromptModel = { providerID: string; modelID: string }
+
+/**
+ * Model and agent selectors arrive from an untrusted client, and both are
+ * optional everywhere: leaving one out means "whatever this instance is
+ * already using". A half-filled selector is dropped rather than forwarded,
+ * because opencode rejects the whole prompt on a bad one and the phone would
+ * see a 400 instead of a reply.
+ */
+function pickModel(value: unknown): PromptModel | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  const { providerID, modelID } = value as Record<string, unknown>
+  if (typeof providerID !== "string" || providerID.length === 0) return undefined
+  if (typeof modelID !== "string" || modelID.length === 0) return undefined
+  return { providerID, modelID }
+}
+
+function pickAgent(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const agent = value.trim()
+  return agent.length > 0 ? agent : undefined
+}
+
+// session.command names the model with a single "provider/model" string rather
+// than the object prompt_async takes. Accept either form so a client can hold
+// one model shape for both routes.
+function pickCommandModel(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const model = value.trim()
+    return model.length > 0 ? model : undefined
+  }
+  const model = pickModel(value)
+  return model ? `${model.providerID}/${model.modelID}` : undefined
+}
 
 let server: ReturnType<typeof Bun.serve> | undefined
 let startedHere = false // this process actually published the tailscale serve entry
@@ -714,9 +748,20 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       // app) can manage this TUI's sessions through the tunnel. Auth: Basic
       // opencode:<token> or ?t=/x-oc-token.
       const parts = seg.split("/").filter(Boolean)
-      if (parts[0] === "session" || seg === "/event") {
+      if (parts[0] === "session" || seg === "/event" || seg === "/config/providers" || seg === "/agent") {
         try {
           if (seg === "/event" && req.method === "GET") return eventStream()
+          // The model and agent catalogues, so a remote client can render a
+          // picker instead of guessing at the instance defaults. Both are
+          // returned exactly as the SDK gives them — each provider carries its
+          // own `models` map alongside a `default` map — because reshaping
+          // here would only date the client.
+          if (seg === "/config/providers" && req.method === "GET") {
+            return sdk(() => client.config.providers({ query: { directory } }))
+          }
+          if (seg === "/agent" && req.method === "GET") {
+            return sdk(() => client.app.agents({ query: { directory } }))
+          }
           if (parts[0] !== "session") return json({ error: "not found" }, 404)
           if (parts.length === 1) {
             if (req.method === "GET") return sdk(() => client.session.list({ query: { directory } }))
@@ -740,17 +785,47 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
               )
             }
             if (parts[2] === "prompt_async" && req.method === "POST") {
-              const body = (await req.json().catch(() => ({}))) as { parts?: Array<{ type: "text"; text: string }> }
+              const body = (await req.json().catch(() => ({}))) as {
+                parts?: Array<{ type: "text"; text: string }>
+                model?: unknown
+                agent?: unknown
+              }
+              const model = pickModel(body.model)
+              const agent = pickAgent(body.agent)
               return sdk(() =>
-                client.session.promptAsync({ path: { id }, body: { parts: body.parts ?? [] }, query: { directory } }),
+                client.session.promptAsync({
+                  path: { id },
+                  body: { parts: body.parts ?? [], ...(model ? { model } : {}), ...(agent ? { agent } : {}) },
+                  query: { directory },
+                }),
               )
             }
             if (parts[2] === "abort" && req.method === "POST") {
               return sdk(() => client.session.abort({ path: { id }, query: { directory } }))
             }
             if (parts[2] === "command" && req.method === "POST") {
-              const body = await req.json().catch(() => ({}))
-              return sdk(() => client.session.command({ path: { id }, body: body as never, query: { directory } }))
+              const body = (await req.json().catch(() => ({}))) as {
+                command?: string
+                arguments?: string
+                messageID?: string
+                model?: unknown
+                agent?: unknown
+              }
+              const model = pickCommandModel(body.model)
+              const agent = pickAgent(body.agent)
+              return sdk(() =>
+                client.session.command({
+                  path: { id },
+                  body: {
+                    command: body.command ?? "",
+                    arguments: body.arguments ?? "",
+                    ...(body.messageID ? { messageID: body.messageID } : {}),
+                    ...(model ? { model } : {}),
+                    ...(agent ? { agent } : {}),
+                  },
+                  query: { directory },
+                }),
+              )
             }
             if (parts[2] === "permissions" && parts[3] && req.method === "POST") {
               const body = (await req.json().catch(() => ({}))) as { response?: string }

@@ -126,11 +126,39 @@ machine pairing token via `?t=`, the `x-oc-token` header, or Basic
 | `POST /session` | `session.create` (`{ title? }`) |
 | `GET /session/status` | `session.status` |
 | `GET /session/:id/message` | `session.messages` (optional `?limit=`) |
-| `POST /session/:id/prompt_async` | `session.promptAsync` (`{ parts: [{ type: "text", text }] }`) |
+| `POST /session/:id/prompt_async` | `session.promptAsync` (`{ parts: [{ type: "text", text }], model?, agent? }`) |
 | `POST /session/:id/abort` | `session.abort` — stops the turn in flight |
-| `POST /session/:id/command` | `session.command` (`{ command, arguments }`) |
+| `POST /session/:id/command` | `session.command` (`{ command, arguments, model?, agent? }`) |
 | `POST /session/:id/permissions/:permissionID` | permission response (`{ response }`) |
+| `GET /config/providers` | `config.providers` — every provider with its `models` map |
+| `GET /agent` | `app.agents` — every agent (`name`, `description`, `mode`, `model`) |
 | `GET /event` | live SSE feed of every SDK event |
+
+#### Choosing a model or an agent
+
+`model` and `agent` are optional on both prompt routes; leaving them out keeps
+whatever the instance is already using. `GET /config/providers` and `GET /agent`
+are the catalogues to populate a picker from, returned unreshaped:
+
+```
+GET /config/providers  → { "providers": [ { "id": "anthropic", "name": "Anthropic",
+                             "models": { "claude-sonnet-4-5": { "name": "Claude Sonnet 4.5", … } } } ],
+                           "default": { "anthropic": "claude-sonnet-4-5" } }
+GET /agent             → [ { "name": "build", "mode": "primary", "model": {…}, … } ]
+```
+
+`prompt_async` takes the model as an object; `command` takes it as a single
+string (the plugin also accepts the object form there and joins it):
+
+```
+POST /session/:id/prompt_async
+{ "parts": [{ "type": "text", "text": "…" }],
+  "model": { "providerID": "anthropic", "modelID": "claude-sonnet-4-5" },
+  "agent": "build" }
+```
+
+A selector missing either half is dropped rather than forwarded, so a partly
+filled picker falls back to the instance default instead of failing the prompt.
 
 `GET /event` emits opencode's **`/global/event` frame shape**, not the bare SDK
 event — the client reads `payload`:
