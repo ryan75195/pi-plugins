@@ -41,6 +41,7 @@ type RemoteState = {
   url: string
   token: string
   port: number
+  mount: string
   name: string
   defaultSession: string
   startedAt: number
@@ -159,6 +160,8 @@ const CLIENT_HTML = `<!doctype html>
   <form id="f"><textarea id="in" rows="1" placeholder="Message…"></textarea><button class="go">Send</button></form>
 </main>
 <script>
+// NOTE: relative API paths (no leading slash) so the client works both at the
+// tailnet root and under a --set-path mount like /rc-xxxx.
 const T = new URLSearchParams(location.search).get('t') || '';
 const q = (p) => p + (p.includes('?') ? '&' : '?') + 't=' + T;
 let cur = null;
@@ -166,7 +169,7 @@ const log = document.getElementById('log'), sess = document.getElementById('sess
       title = document.getElementById('title'), inbox = document.getElementById('in');
 const esc = (s) => { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; };
 async function loadSessions(keep) {
-  const list = await (await fetch(q('/api/sessions'))).json();
+  const list = await (await fetch(q('api/sessions'))).json();
   sess.innerHTML = '';
   for (const s of list) {
     const d = document.createElement('div');
@@ -176,14 +179,14 @@ async function loadSessions(keep) {
     sess.appendChild(d);
   }
   if (!cur || (!keep && !list.find(s => s.id === cur))) {
-    const st = await (await fetch(q('/api/status'))).json();
+    const st = await (await fetch(q('api/status'))).json();
     cur = st.defaultSession || list[0]?.id;
     loadSessions(true); loadMessages();
   }
 }
 async function loadMessages() {
   if (!cur) return;
-  const msgs = await (await fetch(q('/api/messages?session=' + cur))).json();
+  const msgs = await (await fetch(q('api/messages?session=' + cur))).json();
   title.textContent = (msgs.find(m => m.role === 'user')?.text || '').slice(0, 90) || cur.slice(0, 14);
   const near = log.scrollHeight - log.scrollTop - log.clientHeight < 120;
   log.innerHTML = msgs.map(m =>
@@ -195,11 +198,11 @@ document.getElementById('f').onsubmit = async (e) => {
   e.preventDefault();
   const text = inbox.value.trim(); if (!text || !cur) return;
   inbox.value = '';
-  await fetch(q('/api/send'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ session: cur, text }) });
+  await fetch(q('api/send'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ session: cur, text }) });
   setTimeout(loadMessages, 400);
 };
 document.getElementById('new').onclick = async () => {
-  const s = await (await fetch(q('/api/new'), { method: 'POST' })).json();
+  const s = await (await fetch(q('api/new'), { method: 'POST' })).json();
   cur = s.id; loadSessions(); loadMessages();
 };
 setInterval(() => loadSessions(true), 15000);
@@ -236,7 +239,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
   function makeHandler(tok: string, getState: () => RemoteState | undefined) {
     return async (req: Request): Promise<Response> => {
       const url = new URL(req.url)
-      if (url.pathname === "/") {
+      if (url.pathname === "/" || url.pathname === "") {
         if (!authorized(req, tok)) return new Response("unauthorized", { status: 401 })
         return new Response(CLIENT_HTML, { headers: { "content-type": "text/html; charset=utf-8" } })
       }
@@ -314,10 +317,12 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     }
     const tok = randomBytes(16).toString("hex")
     const port = freePort()
+    const mount = `/rc-${randomBytes(3).toString("hex")}`
     const state: RemoteState = {
       url: `https://PENDING/?t=${tok}`,
       token: tok,
       port,
+      mount,
       name: name ?? `opencode on ${machineHost()?.split(".")[0] ?? "host"}`,
       defaultSession: sessionID,
       startedAt: Date.now(),
@@ -326,7 +331,15 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
 
     server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler })
 
-    const serve = tailscale(["serve", "--bg", String(port)])
+    // First choice: own the tailnet root. If another instance (or anything
+    // else) already publishes "/", mount under a unique path instead —
+    // multiple instances can then be remote-controlled at once.
+    let serve = tailscale(["serve", "--bg", String(port)])
+    let path = ""
+    if (!serve.ok) {
+      serve = tailscale(["serve", "--bg", "--set-path", mount, String(port)])
+      path = mount
+    }
     if (!serve.ok) {
       server.stop(true)
       server = undefined
@@ -335,14 +348,15 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
         ? `Serve is not enabled on your tailnet yet. Enable it once (one click, admin of your tailnet) at:\n${enableUrl}\nThen run /remote-control again.`
         : `tailscale serve failed:\n${serve.out}`
     }
+    state.mount = path === "" ? "/" : mount
     const host = machineHost()
     if (!host) {
       server.stop(true)
       server = undefined
-      void tailscale(["serve", "reset"])
+      void tailscale(["serve", "--set-path", mount, "off"])
       return "could not read tailnet hostname (tailscale status failed)"
     }
-    state.url = `https://${host}/?t=${tok}`
+    state.url = `https://${host}${path}/?t=${tok}`
     persist(state)
     startedHere = true
     return [
@@ -368,9 +382,13 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     sseClients.clear()
     if (!startedHere) return "Remote Control was not active in this process."
     startedHere = false
+    const prev = loadPersisted()
+    const mount = prev && !("stoppedAt" in prev) ? prev.mount : "/"
     persist({ stoppedAt: Date.now() })
-    const r = tailscale(["serve", "reset"])
-    return r.ok ? "Remote Control off. Local session unaffected." : `Remote Control off, but tailscale serve reset failed: ${r.out}`
+    // Targeted removal of OUR mount only — never reset other instances' mounts.
+    let r = tailscale(["serve", "--set-path", mount, "off"])
+    if (!r.ok && mount === "/") r = tailscale(["serve", "reset"])
+    return r.ok ? "Remote Control off. Local session unaffected." : `Remote Control off, but tailscale removal failed: ${r.out}`
   }
 
   return {
