@@ -32,6 +32,7 @@ declare const Bun: {
   serve(options: {
     hostname: string
     port: number
+    idleTimeout?: number
     fetch: (req: Request) => Response | Promise<Response>
   }): { stop(closeActiveConnections?: boolean): void }
 }
@@ -49,6 +50,11 @@ const MACHINE_FILE = join(MACHINE_DIR, "machine.json")
 const HUB_MOUNT = "/rc-hub"
 const HUB_PORT = 8579 // fixed; instance ports start at 8580, so they never collide
 const HUB_WATCHDOG_MS = 3_000
+// Bun.serve closes a connection that is idle for 10 s by default, which kills
+// an SSE stream before its first keepalive. 255 s is Bun's maximum; the
+// keepalive below fires far more often than that anyway.
+const SERVER_IDLE_TIMEOUT_S = 255
+const SSE_KEEPALIVE_MS = 5_000
 const BASE_PORT = 8580
 const MAX_EVENTS = 400
 
@@ -508,7 +514,7 @@ async function hubHandler(req: Request): Promise<Response> {
 function tryHostHub(): boolean {
   if (hubServer) return true
   try {
-    hubServer = Bun.serve({ hostname: "127.0.0.1", port: HUB_PORT, fetch: hubHandler })
+    hubServer = Bun.serve({ hostname: "127.0.0.1", port: HUB_PORT, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: hubHandler })
     return true
   } catch {
     return false // another instance already hosts it — the normal case
@@ -699,7 +705,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
         write("retry: 3000\n\n")
         // tailscale serve (and any proxy in between) drops a stream that goes
         // quiet. A comment frame keeps it warm and every SSE parser ignores it.
-        keepalive = setInterval(() => write(": ping\n\n"), 15_000)
+        keepalive = setInterval(() => write(": ping\n\n"), SSE_KEEPALIVE_MS)
         try {
           const sub = await client.event.subscribe({ signal: upstream.signal })
           for await (const event of sub.stream) {
@@ -892,7 +898,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
                 return
               }
               write(": ping\n\n")
-            }, 15_000)
+            }, SSE_KEEPALIVE_MS)
           },
           cancel() {
             closed = true
@@ -935,7 +941,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     }
     const handler = makeHandler(tok, () => state)
 
-    server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler })
+    server = Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: handler })
 
     log(`start id=${id} port=${port} mount=${mount} dir=${directory}`)
     const serve = tailscale(["serve", "--bg", "--set-path", mount, String(port)])
