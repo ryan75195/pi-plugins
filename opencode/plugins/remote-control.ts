@@ -77,6 +77,9 @@ let startedHere = false // this process actually published the tailscale serve e
 let activeState: RemoteState | undefined // this process's registration (in-memory truth)
 let eventLog: Array<{ type: string; sessionID?: string }> = []
 const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>()
+// Live /event subscribers, counted so a leaked subscription shows up in the log
+// rather than only as quietly growing memory.
+let openEventStreams = 0
 
 /**
  * Registrations are stored per machine as a LIST keyed by process pid —
@@ -619,6 +622,76 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     return out
   }
 
+  /**
+   * Live SDK event feed, in the shape native clients already speak: opencode's
+   * own /global/event wraps every event as { directory, payload } and the app
+   * reads `payload`. Emitting the bare SDK event here left `payload` undefined,
+   * so the app threw on every frame and reconnected forever — nothing streamed.
+   * Every event type is forwarded untouched; filtering belongs to the client.
+   */
+  function eventStream(): Response {
+    const encoder = new TextEncoder()
+    // The SDK's SSE client honours `signal`: aborting it cancels the reader and
+    // ends the generator, so the upstream subscription is actually released
+    // instead of iterating on for a client that has gone away.
+    const upstream = new AbortController()
+    let closed = false
+    let keepalive: ReturnType<typeof setInterval> | undefined
+
+    const release = (reason: string) => {
+      if (closed) return
+      closed = true
+      if (keepalive) clearInterval(keepalive)
+      keepalive = undefined
+      upstream.abort()
+      openEventStreams = Math.max(0, openEventStreams - 1)
+      log(`event stream closed (${reason}) open=${openEventStreams}`)
+    }
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        openEventStreams++
+        log(`event stream opened open=${openEventStreams}`)
+        const write = (chunk: string): boolean => {
+          if (closed) return false
+          try {
+            controller.enqueue(encoder.encode(chunk))
+            return true
+          } catch {
+            release("write failed")
+            return false
+          }
+        }
+        write("retry: 3000\n\n")
+        // tailscale serve (and any proxy in between) drops a stream that goes
+        // quiet. A comment frame keeps it warm and every SSE parser ignores it.
+        keepalive = setInterval(() => write(": ping\n\n"), 15_000)
+        try {
+          const sub = await client.event.subscribe({ signal: upstream.signal })
+          for await (const event of sub.stream) {
+            if (closed) break
+            if (!write(`data: ${JSON.stringify({ directory, payload: event })}\n\n`)) break
+          }
+        } catch {
+          write("event: error\ndata: {}\n\n")
+        }
+        release("upstream ended")
+        try {
+          controller.close()
+        } catch {
+          /* already closed */
+        }
+      },
+      cancel() {
+        release("client disconnected")
+      },
+    })
+
+    return new Response(stream, {
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+    })
+  }
+
   function makeHandler(tok: string, getState: () => RemoteState | undefined) {
     const sdk = async (
       run: () => Promise<{ data?: unknown; error?: unknown; response?: { status?: number } }>,
@@ -643,37 +716,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       const parts = seg.split("/").filter(Boolean)
       if (parts[0] === "session" || seg === "/event") {
         try {
-          if (seg === "/event" && req.method === "GET") {
-            const enc2 = new TextEncoder()
-            const stream = new ReadableStream<Uint8Array>({
-              async start(controller) {
-                const write = (chunk: string) => {
-                  try {
-                    controller.enqueue(enc2.encode(chunk))
-                  } catch {
-                    /* client gone */
-                  }
-                }
-                write("retry: 3000\n\n")
-                try {
-                  const sub = await client.event.subscribe()
-                  for await (const event of sub.stream) {
-                    write(`data: ${JSON.stringify(event)}\n\n`)
-                  }
-                } catch {
-                  write("event: error\ndata: {}\n\n")
-                }
-                try {
-                  controller.close()
-                } catch {
-                  /* already closed */
-                }
-              },
-            })
-            return new Response(stream, {
-              headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
-            })
-          }
+          if (seg === "/event" && req.method === "GET") return eventStream()
           if (parts[0] !== "session") return json({ error: "not found" }, 404)
           if (parts.length === 1) {
             if (req.method === "GET") return sdk(() => client.session.list({ query: { directory } }))
@@ -701,6 +744,9 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
               return sdk(() =>
                 client.session.promptAsync({ path: { id }, body: { parts: body.parts ?? [] }, query: { directory } }),
               )
+            }
+            if (parts[2] === "abort" && req.method === "POST") {
+              return sdk(() => client.session.abort({ path: { id }, query: { directory } }))
             }
             if (parts[2] === "command" && req.method === "POST") {
               const body = await req.json().catch(() => ({}))
