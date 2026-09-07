@@ -96,8 +96,8 @@ running locally; the remote client is a window into it.
 - `opencode/commands/remote-control.md` — `/remote-control [name]`, `off`, `status`.
 
 Setup: enable Tailscale Serve once (the plugin prints the enable link if it is
-not on). Requires `tailscale` on PATH. Install = copy both files as with the
-other plugins/commands.
+not on). Requires `tailscale` on PATH. Install with `npm run install:opencode`
+(see below).
 
 Architecture:
 
@@ -108,3 +108,67 @@ browser on tailnet ──https://<host>.ts.net/?t=<token>──► tailscale ser
 
 The web client lists sessions, streams the transcript, opens new sessions, and
 queues messages mid-turn (delivered after the current turn, like Claude Code).
+
+### Pairing (phone app)
+
+A phone pairs **once per machine**, not once per session. After that, every
+instance that runs `/remote-control` shows up in the app on its own and
+disappears again on `/remote-control off`.
+
+```
+/remote-control pair            # prints the pair URL — paste it into the app once
+/remote-control rotate-pairing  # mint a new token (the old one stops working)
+```
+
+The pair URL is
+
+```
+https://<tailnet-host>/rc-hub/?t=<pairingToken>
+```
+
+The pairing token is machine-scoped and durable: it lives in
+`~/.config/opencode/remote-control/machine.json` as
+`{ "pairingToken": "…", "createdAt": 1757… }`, is minted on first use, and
+survives restarts. Every instance endpoint accepts either its own instance
+token or the pairing token, through `?t=`, the `x-oc-token` header, or Basic
+`opencode:<token>`.
+
+Opening the pair URL in a browser is also a quick check that pairing works —
+it renders a "Paired" page listing the instances currently running.
+
+### Hub endpoint
+
+The hub is what makes "pair once" work: one endpoint per machine, on fixed
+port **8579**, published at `/rc-hub` and gated by the pairing token alone
+(instance ports start at 8580, so they never collide). Instance tokens are
+never returned by it.
+
+| Route | Response |
+|-------|----------|
+| `GET /health` | `{ "ok": true }` |
+| `GET /instances` | `{ machine: { host, name }, instances: […] }` |
+| `GET /` | small "Paired" page listing the instances |
+
+`GET /instances` returns, per instance: `id`, `name`, `directory`, `host`,
+`mount` (`/` or `/rc-xxxxxx`), `port`, `defaultSession`, `startedAt`, and
+`alive` (the pid is alive **and** the port answers). `id` is derived from the
+working directory, so it is stable across restarts and an app can keep
+per-instance state against it.
+
+No instance owns the hub. The first registered process that can bind 8579
+hosts it; every registered process runs a 3-second watchdog and rebinds if the
+port goes quiet, so the hub survives whichever instance happens to exit. The
+`/rc-hub` tailscale mount is removed only when the last registration goes away.
+
+## Install (opencode plugins + commands)
+
+```bash
+npm run install:opencode
+```
+
+Copies `opencode/plugins/*.ts` → `~/.config/opencode/plugins/` and
+`opencode/commands/*.md` → `~/.config/opencode/commands/`, printing what it
+copied. These are **copies, not symlinks**, so:
+
+> Run `npm run install:opencode` after every merge, then restart running
+> opencode instances to pick up the new code.
