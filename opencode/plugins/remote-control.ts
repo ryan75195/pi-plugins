@@ -19,11 +19,11 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { connect } from "node:net"
 
 // opencode runs on Bun, so this global exists at runtime. Minimal ambient decl
@@ -43,15 +43,20 @@ const STATE_FILE = join(STATE_DIR, "state.json")
 const MACHINE_DIR = join(homedir(), ".config", "opencode", "remote-control")
 const MACHINE_FILE = join(MACHINE_DIR, "machine.json")
 const HUB_MOUNT = "/rc-hub"
+const HUB_PORT = 8579 // fixed; instance ports start at 8580, so they never collide
+const HUB_WATCHDOG_MS = 3_000
 const BASE_PORT = 8580
 const MAX_EVENTS = 400
 
 type RemoteState = {
+  id: string // stable across restarts (derived from the directory)
   url: string
   token: string
   port: number
   mount: string
   name: string
+  directory: string
+  host: string // tailnet DNS name of the machine
   defaultSession: string
   startedAt: number
   pid: number
@@ -178,6 +183,9 @@ async function pruneStale(): Promise<void> {
       for (const host of Object.values(parsed.Web ?? {})) {
         for (const [mount, handler] of Object.entries(host.Handlers ?? {})) {
           if (!mount.startsWith("/rc-")) continue
+          // The hub is ours and shared: keep it as long as anyone is registered,
+          // even in the window where no process has rebound port 8579 yet.
+          if (mount === HUB_MOUNT && liveRegistrations().length > 0) continue
           const port = Number(handler.Proxy?.match(/:(\d+)$/)?.[1])
           if (!port || !(await portAlive(port))) mounts.push(mount)
         }
@@ -233,18 +241,43 @@ function tailscale(args: string[]): { ok: boolean; out: string } {
   return { ok: false, out: last || "tailscale command not found on PATH" }
 }
 
+// The tailnet name never changes while the daemon runs, and the hub answers
+// /instances on every app poll — cache it rather than spawning tailscale per
+// request. Only successful lookups are cached.
+let cachedHost: string | undefined
+
 function machineHost(): string | undefined {
+  if (cachedHost) return cachedHost
   for (const cmd of TAILSCALE_CANDIDATES) {
     const r = spawnSync(cmd, ["status", "--json"], { encoding: "utf8", timeout: 20_000, windowsHide: true })
     if (r.error || r.status !== 0) continue
     try {
       const dns = (JSON.parse(r.stdout) as { Self?: { DNSName?: string } }).Self?.DNSName
-      if (dns) return dns.replace(/\.$/, "")
+      if (dns) {
+        cachedHost = dns.replace(/\.$/, "")
+        return cachedHost
+      }
     } catch {
       /* try next candidate */
     }
   }
   return undefined
+}
+
+function machineName(): string {
+  return machineHost()?.split(".")[0] ?? hostname().split(".")[0] ?? "host"
+}
+
+/**
+ * Instance identity the app can hold onto: the same working directory keeps
+ * the same id across restarts, so a phone's per-instance state survives an
+ * opencode relaunch. Two live processes on one directory are disambiguated by
+ * pid rather than colliding.
+ */
+function instanceId(dir: string): string {
+  const base = createHash("sha1").update(dir).digest("hex").slice(0, 12)
+  const clash = loadRegistrations().some((r) => r.id === base && r.pid !== process.pid && pidAlive(r.pid))
+  return clash ? `${base}-${process.pid}` : base
 }
 
 function freePort(): number {
@@ -291,6 +324,138 @@ function authorized(req: Request, ...accepted: string[]): boolean {
 
 function authorizedInstance(req: Request, tok: string): boolean {
   return authorized(req, tok, pairingConfig().pairingToken)
+}
+
+// ── Hub ─────────────────────────────────────────────────────────────────────
+// One endpoint per MACHINE on a fixed port, so an app that paired once can see
+// which instances are running here without knowing any instance token. The hub
+// belongs to no particular instance: whichever registered process can bind the
+// port hosts it, and the rest take over within a watchdog tick if it dies.
+
+let hubServer: ReturnType<typeof Bun.serve> | undefined
+let hubWatchdog: ReturnType<typeof setInterval> | undefined
+
+type InstanceView = {
+  id: string
+  name: string
+  directory: string
+  host: string
+  mount: string
+  port: number
+  defaultSession: string
+  startedAt: number
+  alive: boolean
+}
+
+function liveRegistrations(): RemoteState[] {
+  return loadRegistrations().filter((r) => pidAlive(r.pid))
+}
+
+/**
+ * Registrations as the app sees them. Deliberately omits `token`: the hub is
+ * reachable with the pairing token, and that must not be a way to harvest
+ * every instance's credentials.
+ */
+async function instanceViews(): Promise<InstanceView[]> {
+  return Promise.all(
+    loadRegistrations().map(async (r) => ({
+      id: r.id || createHash("sha1").update(r.directory || String(r.pid)).digest("hex").slice(0, 12),
+      name: r.name,
+      directory: r.directory ?? "",
+      host: r.host || machineHost() || "",
+      mount: r.mount || "/",
+      port: r.port,
+      defaultSession: r.defaultSession,
+      startedAt: r.startedAt,
+      alive: pidAlive(r.pid) && (await portAlive(r.port)),
+    })),
+  )
+}
+
+function hubPage(instances: InstanceView[]): string {
+  const rows = instances
+    .map(
+      (i) =>
+        `<li><b>${escapeHtml(i.name)}</b> <span class="d">${escapeHtml(i.directory)}</span> <span class="${i.alive ? "up" : "down"}">${i.alive ? "running" : "stale"}</span></li>`,
+    )
+    .join("")
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>opencode remote — paired</title>
+<style>body{background:#0d0f12;color:#d7dde6;font:15px/1.6 ui-sans-serif,system-ui,sans-serif;margin:0;padding:28px}
+h1{font-size:19px;margin:0 0 4px}p{color:#7d8794;margin:0 0 18px}ul{list-style:none;padding:0;margin:0}
+li{border:1px solid #242a33;border-radius:10px;padding:10px 13px;margin-bottom:8px}
+.d{color:#7d8794;font-size:13px}.up{color:#5fd48a;font-size:13px}.down{color:#7d8794;font-size:13px}</style>
+</head><body><h1>Paired &check;</h1><p>This machine is reachable. Instances running Remote Control:</p>
+<ul>${rows || '<li class="d">none right now — run /remote-control in an opencode session</li>'}</ul></body></html>`
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c] ?? c)
+}
+
+/**
+ * `tailscale serve --set-path /rc-hub` strips the prefix before proxying, so
+ * the paths seen here are bare: /, /health, /instances.
+ */
+async function hubHandler(req: Request): Promise<Response> {
+  const seg = new URL(req.url).pathname.replace(/\/+$/, "") || "/"
+  if (!authorized(req, pairingConfig().pairingToken)) {
+    return seg === "/" ? new Response("unauthorized", { status: 401 }) : json({ error: "unauthorized" }, 401)
+  }
+  if (seg === "/health") return json({ ok: true })
+  if (seg === "/instances") {
+    return json({
+      machine: { host: machineHost() ?? "", name: machineName() },
+      instances: await instanceViews(),
+    })
+  }
+  if (seg === "/") {
+    return new Response(hubPage(await instanceViews()), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    })
+  }
+  return json({ error: "not found" }, 404)
+}
+
+function tryHostHub(): boolean {
+  if (hubServer) return true
+  try {
+    hubServer = Bun.serve({ hostname: "127.0.0.1", port: HUB_PORT, fetch: hubHandler })
+    return true
+  } catch {
+    return false // another instance already hosts it — the normal case
+  }
+}
+
+/**
+ * Called by every process that holds a registration. First one in wins the
+ * port; the losers keep probing so the hub survives the host instance exiting
+ * (or crashing) without any handoff protocol.
+ */
+function ensureHub(): void {
+  tryHostHub()
+  if (hubWatchdog) return
+  hubWatchdog = setInterval(() => {
+    if (hubServer) return
+    void portAlive(HUB_PORT).then((up) => {
+      if (!up) tryHostHub()
+    })
+  }, HUB_WATCHDOG_MS)
+}
+
+function releaseHub(): void {
+  if (hubWatchdog) {
+    clearInterval(hubWatchdog)
+    hubWatchdog = undefined
+  }
+  if (hubServer) {
+    hubServer.stop(true)
+    hubServer = undefined
+  }
+}
+
+function publishHub(): void {
+  void tailscale(["serve", "--bg", "--set-path", HUB_MOUNT, String(HUB_PORT)])
 }
 
 const CLIENT_HTML = `<!doctype html>
@@ -580,11 +745,14 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     const port = freePort()
     const mount = `/rc-${randomBytes(3).toString("hex")}`
     const state: RemoteState = {
+      id: instanceId(directory),
       url: `https://PENDING/?t=${tok}`,
       token: tok,
       port,
       mount,
-      name: name ?? `opencode on ${machineHost()?.split(".")[0] ?? "host"}`,
+      name: name ?? `opencode on ${machineName()}`,
+      directory,
+      host: "",
       defaultSession: sessionID,
       startedAt: Date.now(),
       pid: process.pid,
@@ -622,12 +790,17 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       void tailscale(["serve", "--set-path", mount, "off"])
       return "could not read tailnet hostname (tailscale status failed)"
     }
+    state.host = host
     state.url = `https://${host}${path}/?t=${tok}`
     activeState = state
     const regs = loadRegistrations().filter((r) => r.pid !== process.pid)
     regs.push(state)
     persistRegistrations(regs)
     startedHere = true
+    // The hub is per machine, not per instance: publish the mount every time
+    // (idempotent) and take the port if nobody holds it yet.
+    publishHub()
+    ensureHub()
     return [
       "Remote Control is ON for this session.",
       `Open from any device on your tailnet: ${state.url}`,
@@ -641,6 +814,9 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       server.stop(true)
       server = undefined
     }
+    // Drop the hub port too — any other live instance rebinds it on its next
+    // watchdog tick, so the machine stays discoverable.
+    releaseHub()
     for (const c of sseClients) {
       try {
         c.write("event: shutdown\ndata: {}\n\n")
@@ -658,6 +834,8 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     // Targeted removal of OUR mount only — never reset other instances' mounts.
     let r = tailscale(["serve", "--set-path", mount, "off"])
     if (!r.ok && mount === "/") r = tailscale(["serve", "reset"])
+    // The hub mount is shared: it goes away only with the last instance.
+    if (liveRegistrations().length === 0) void tailscale(["serve", "--set-path", HUB_MOUNT, "off"])
     return r.ok ? "Remote Control off. Local session unaffected." : `Remote Control off, but tailscale removal failed: ${r.out}`
   }
 
@@ -681,6 +859,10 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
             if (args.action === "rotate-pairing") rotatePairingToken()
             const url = pairUrl()
             if (!url) return "could not read tailnet hostname (tailscale status failed) — is Tailscale running?"
+            // Bring the hub up now so the app can verify the pairing straight
+            // away, before any session has run /remote-control.
+            publishHub()
+            ensureHub()
             return [
               url,
               args.action === "rotate-pairing"
