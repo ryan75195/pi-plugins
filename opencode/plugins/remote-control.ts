@@ -193,7 +193,19 @@ function json(data: unknown, status = 200): Response {
 
 function authorized(req: Request, tok: string): boolean {
   const url = new URL(req.url)
-  return url.searchParams.get("t") === tok || req.headers.get("x-oc-token") === tok
+  if (url.searchParams.get("t") === tok || req.headers.get("x-oc-token") === tok) return true
+  // Native clients (e.g. opencode-ios) auth with Basic: opencode:<token>.
+  const auth = req.headers.get("authorization")
+  if (auth?.startsWith("Basic ")) {
+    try {
+      const decoded = atob(auth.slice(6))
+      const idx = decoded.indexOf(":")
+      return idx >= 0 && decoded.slice(idx + 1) === tok
+    } catch {
+      return false
+    }
+  }
+  return false
 }
 
 const CLIENT_HTML = `<!doctype html>
@@ -307,13 +319,107 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
   }
 
   function makeHandler(tok: string, getState: () => RemoteState | undefined) {
+    const sdk = async (
+      run: () => Promise<{ data?: unknown; error?: unknown; response?: { status?: number } }>,
+    ): Promise<Response> => {
+      const res = await run()
+      if (res.error !== undefined && res.error !== null) return json(res.error, res.response?.status ?? 500)
+      return json(res.data)
+    }
+
     return async (req: Request): Promise<Response> => {
       const url = new URL(req.url)
-      if (url.pathname === "/" || url.pathname === "") {
+      const seg = url.pathname.replace(/\/+$/, "") || "/"
+      if (seg === "/" || seg === "") {
         if (!authorized(req, tok)) return new Response("unauthorized", { status: 401 })
         return new Response(CLIENT_HTML, { headers: { "content-type": "text/html; charset=utf-8" } })
       }
       if (!authorized(req, tok)) return json({ error: "unauthorized" }, 401)
+
+      // Native opencode REST surface so native clients (opencode-ios, any REST
+      // app) can manage this TUI's sessions through the tunnel. Auth: Basic
+      // opencode:<token> or ?t=/x-oc-token.
+      const parts = seg.split("/").filter(Boolean)
+      if (parts[0] === "session" || seg === "/event") {
+        try {
+          if (seg === "/event" && req.method === "GET") {
+            const enc2 = new TextEncoder()
+            const stream = new ReadableStream<Uint8Array>({
+              async start(controller) {
+                const write = (chunk: string) => {
+                  try {
+                    controller.enqueue(enc2.encode(chunk))
+                  } catch {
+                    /* client gone */
+                  }
+                }
+                write("retry: 3000\n\n")
+                try {
+                  const sub = await client.event.subscribe()
+                  for await (const event of sub.stream) {
+                    write(`data: ${JSON.stringify(event)}\n\n`)
+                  }
+                } catch {
+                  write("event: error\ndata: {}\n\n")
+                }
+                try {
+                  controller.close()
+                } catch {
+                  /* already closed */
+                }
+              },
+            })
+            return new Response(stream, {
+              headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+            })
+          }
+          if (parts[0] !== "session") return json({ error: "not found" }, 404)
+          if (parts.length === 1) {
+            if (req.method === "GET") return sdk(() => client.session.list({ query: { directory } }))
+            if (req.method === "POST") {
+              const body = (await req.json().catch(() => ({}))) as { title?: string }
+              return sdk(() => client.session.create({ body: { title: body.title }, query: { directory } }))
+            }
+          }
+          if (parts.length === 2 && parts[1] === "status" && req.method === "GET") {
+            return sdk(() => client.session.status({ query: { directory } }))
+          }
+          if (parts.length >= 3) {
+            const id = parts[1]
+            if (parts[2] === "message" && req.method === "GET") {
+              const limit = Number(url.searchParams.get("limit"))
+              return sdk(() =>
+                client.session.messages({
+                  path: { id },
+                  query: { ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}), directory },
+                }),
+              )
+            }
+            if (parts[2] === "prompt_async" && req.method === "POST") {
+              const body = (await req.json().catch(() => ({}))) as { parts?: Array<{ type: "text"; text: string }> }
+              return sdk(() =>
+                client.session.promptAsync({ path: { id }, body: { parts: body.parts ?? [] }, query: { directory } }),
+              )
+            }
+            if (parts[2] === "command" && req.method === "POST") {
+              const body = await req.json().catch(() => ({}))
+              return sdk(() => client.session.command({ path: { id }, body: body as never, query: { directory } }))
+            }
+            if (parts[2] === "permissions" && parts[3] && req.method === "POST") {
+              const body = (await req.json().catch(() => ({}))) as { response?: string }
+              return sdk(() =>
+                client.postSessionIdPermissionsPermissionId({
+                  path: { id, permissionID: parts[3] },
+                  body: { response: body.response as never },
+                  query: { directory },
+                }),
+              )
+            }
+          }
+        } catch (e) {
+          return json({ error: String(e) }, 502)
+        }
+      }
 
       if (url.pathname === "/api/status") return json({ ok: true, ...getState() })
 
