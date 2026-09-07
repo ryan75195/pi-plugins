@@ -111,6 +111,43 @@ browser on tailnet ──https://<host>.ts.net/rc-<id>/?t=<token>──► tails
 The web client lists sessions, streams the transcript, opens new sessions, and
 queues messages mid-turn (delivered after the current turn, like Claude Code).
 
+### Native REST surface (phone app)
+
+Each instance endpoint also proxies a subset of opencode's own REST API, so a
+native client (opencode-ios, or anything speaking REST) drives the session
+directly instead of scraping the web client. Paths are relative to the mount
+(`https://<host>/rc-<id>/…`), and every route takes the instance token or the
+machine pairing token via `?t=`, the `x-oc-token` header, or Basic
+`opencode:<token>`.
+
+| Route | Proxies to |
+|-------|------------|
+| `GET /session` | `session.list` |
+| `POST /session` | `session.create` (`{ title? }`) |
+| `GET /session/status` | `session.status` |
+| `GET /session/:id/message` | `session.messages` (optional `?limit=`) |
+| `POST /session/:id/prompt_async` | `session.promptAsync` (`{ parts: [{ type: "text", text }] }`) |
+| `POST /session/:id/abort` | `session.abort` — stops the turn in flight |
+| `POST /session/:id/command` | `session.command` (`{ command, arguments }`) |
+| `POST /session/:id/permissions/:permissionID` | permission response (`{ response }`) |
+| `GET /event` | live SSE feed of every SDK event |
+
+`GET /event` emits opencode's **`/global/event` frame shape**, not the bare SDK
+event — the client reads `payload`:
+
+```
+data: {"directory":"C:\\path\\to\\project","payload":{"id":"evt_…","type":"message.part.updated","properties":{…}}}
+```
+
+Every event type is forwarded untouched (`message.updated`,
+`message.part.updated`, `session.status`, `session.idle`, `permission.*`,
+`session.*`); filtering is the client's job. The stream sends `retry: 3000`
+first and a `: ping` comment every 15 s, because `tailscale serve` (and any
+proxy in between) drops a stream that goes quiet. When the client disconnects,
+the upstream SDK subscription is aborted rather than left iterating; open and
+close are recorded in `remote-control.log` with the live stream count, so a leak
+is visible.
+
 ### Pairing (phone app)
 
 A phone pairs **once per machine**, not once per session. After that, every
