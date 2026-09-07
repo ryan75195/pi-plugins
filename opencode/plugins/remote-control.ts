@@ -8,6 +8,8 @@
  *   /remote-control          → register current session, print the URL
  *   /remote-control off      → unregister (removes tailscale serve + endpoint)
  *   /remote-control status   → connection state
+ *   /remote-control pair     → print the machine pair URL (one-time app pairing)
+ *   /remote-control rotate-pairing → mint a new pairing token
  *
  * Substrate: `tailscale serve --bg` publishes the tailnet's HTTPS endpoint for
  * this machine and proxies it to a localhost-only HTTP endpoint hosted by this
@@ -21,6 +23,7 @@ import { randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { homedir } from "node:os"
 import { connect } from "node:net"
 
 // opencode runs on Bun, so this global exists at runtime. Minimal ambient decl
@@ -35,6 +38,11 @@ declare const Bun: {
 
 const STATE_DIR = join(process.env.TEMP ?? "/tmp", "opencode-remote")
 const STATE_FILE = join(STATE_DIR, "state.json")
+// Durable, machine-scoped pairing lives outside TEMP: a phone pairs once and
+// keeps working across reboots and across every opencode instance.
+const MACHINE_DIR = join(homedir(), ".config", "opencode", "remote-control")
+const MACHINE_FILE = join(MACHINE_DIR, "machine.json")
+const HUB_MOUNT = "/rc-hub"
 const BASE_PORT = 8580
 const MAX_EVENTS = 400
 
@@ -84,6 +92,49 @@ function loadRegistrations(): RemoteState[] {
   } catch {
     return []
   }
+}
+
+type MachineConfig = { pairingToken: string; createdAt: number }
+
+let pairingCache: MachineConfig | undefined
+
+/**
+ * The pairing token identifies the MACHINE, not a session — it is what the
+ * phone app stores after a single pairing and what gates the hub. Instance
+ * tokens stay per-registration and short-lived; this one is durable.
+ */
+function pairingConfig(): MachineConfig {
+  if (pairingCache) return pairingCache
+  try {
+    if (existsSync(MACHINE_FILE)) {
+      const raw = JSON.parse(readFileSync(MACHINE_FILE, "utf8")) as Partial<MachineConfig>
+      if (typeof raw?.pairingToken === "string" && raw.pairingToken.length > 0) {
+        pairingCache = { pairingToken: raw.pairingToken, createdAt: raw.createdAt ?? Date.now() }
+        return pairingCache
+      }
+    }
+  } catch {
+    /* unreadable/corrupt — mint a fresh one below */
+  }
+  return writePairingConfig(randomBytes(16).toString("hex"))
+}
+
+function writePairingConfig(token: string): MachineConfig {
+  const config: MachineConfig = { pairingToken: token, createdAt: Date.now() }
+  mkdirSync(MACHINE_DIR, { recursive: true })
+  writeFileSync(MACHINE_FILE, JSON.stringify(config, null, 2))
+  pairingCache = config
+  return config
+}
+
+function rotatePairingToken(): MachineConfig {
+  return writePairingConfig(randomBytes(16).toString("hex"))
+}
+
+function pairUrl(): string | undefined {
+  const host = machineHost()
+  if (!host) return undefined
+  return `https://${host}${HUB_MOUNT}/?t=${pairingConfig().pairingToken}`
 }
 
 function portAlive(port: number): Promise<boolean> {
@@ -213,21 +264,33 @@ function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } })
 }
 
-function authorized(req: Request, tok: string): boolean {
+/**
+ * Every endpoint accepts the caller's own token OR the durable machine pairing
+ * token, through any of the three mechanisms — a paired app holds only the
+ * pairing token and must still be able to talk to each instance.
+ */
+function authorized(req: Request, ...accepted: string[]): boolean {
+  const tokens = new Set(accepted.filter(Boolean))
   const url = new URL(req.url)
-  if (url.searchParams.get("t") === tok || req.headers.get("x-oc-token") === tok) return true
+  const query = url.searchParams.get("t")
+  const header = req.headers.get("x-oc-token")
+  if ((query && tokens.has(query)) || (header && tokens.has(header))) return true
   // Native clients (e.g. opencode-ios) auth with Basic: opencode:<token>.
   const auth = req.headers.get("authorization")
   if (auth?.startsWith("Basic ")) {
     try {
       const decoded = atob(auth.slice(6))
       const idx = decoded.indexOf(":")
-      return idx >= 0 && decoded.slice(idx + 1) === tok
+      return idx >= 0 && tokens.has(decoded.slice(idx + 1))
     } catch {
       return false
     }
   }
   return false
+}
+
+function authorizedInstance(req: Request, tok: string): boolean {
+  return authorized(req, tok, pairingConfig().pairingToken)
 }
 
 const CLIENT_HTML = `<!doctype html>
@@ -353,10 +416,10 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       const url = new URL(req.url)
       const seg = url.pathname.replace(/\/+$/, "") || "/"
       if (seg === "/" || seg === "") {
-        if (!authorized(req, tok)) return new Response("unauthorized", { status: 401 })
+        if (!authorizedInstance(req, tok)) return new Response("unauthorized", { status: 401 })
         return new Response(CLIENT_HTML, { headers: { "content-type": "text/html; charset=utf-8" } })
       }
-      if (!authorized(req, tok)) return json({ error: "unauthorized" }, 401)
+      if (!authorizedInstance(req, tok)) return json({ error: "unauthorized" }, 401)
 
       // Native opencode REST surface so native clients (opencode-ios, any REST
       // app) can manage this TUI's sessions through the tunnel. Auth: Basic
@@ -602,14 +665,29 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     tool: {
       remote_control: tool({
         description:
-          "Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet. Actions: 'toggle' turns it off if it is on, on if it is off — use this for a bare /remote-control. 'on' forces registration, 'off' unregisters, 'status' reports state.",
+          "Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet. Actions: 'toggle' turns it off if it is on, on if it is off — use this for a bare /remote-control. 'on' forces registration, 'off' unregisters, 'status' reports state. 'pair' prints the one-time pair URL for the phone app (a machine-level token, valid for every instance on this machine); 'rotate-pairing' mints a new pairing token and invalidates the old one.",
         args: {
-          action: tool.schema.enum(["toggle", "on", "off", "status"]).describe("toggle = flip on/off (default for /remote-control), on = register, off = unregister, status = report"),
+          action: tool.schema
+            .enum(["toggle", "on", "off", "status", "pair", "rotate-pairing"])
+            .describe(
+              "toggle = flip on/off (default for /remote-control), on = register, off = unregister, status = report, pair = print the machine pair URL for the app, rotate-pairing = mint a new pairing token",
+            ),
           name: tool.schema.string().optional().describe("optional display name shown in the remote session list"),
         },
         async execute(args, context) {
           if (args.action === "toggle") return server ? stop() : start(args.name || undefined, context.sessionID)
           if (args.action === "off") return stop()
+          if (args.action === "pair" || args.action === "rotate-pairing") {
+            if (args.action === "rotate-pairing") rotatePairingToken()
+            const url = pairUrl()
+            if (!url) return "could not read tailnet hostname (tailscale status failed) — is Tailscale running?"
+            return [
+              url,
+              args.action === "rotate-pairing"
+                ? "New pairing token. Paste this URL into the app once; the previous one no longer works."
+                : "Paste this URL into the app once. Every instance that runs /remote-control on this machine then shows up automatically.",
+            ].join("\n")
+          }
           if (args.action === "status") {
             const regs = loadRegistrations()
             if (regs.length === 0) return "Remote Control: not active. Run /remote-control to register this session."
