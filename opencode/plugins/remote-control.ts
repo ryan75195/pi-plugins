@@ -21,7 +21,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { createHash, randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { basename, join } from "node:path"
 import { homedir, hostname } from "node:os"
 import { connect } from "node:net"
@@ -38,6 +38,10 @@ declare const Bun: {
 
 const STATE_DIR = join(process.env.TEMP ?? "/tmp", "opencode-remote")
 const STATE_FILE = join(STATE_DIR, "state.json")
+// Append-only diagnostics: every tailscale call and every registration
+// decision, so "why did my instance vanish" has an answer.
+const LOG_FILE = join(STATE_DIR, "remote-control.log")
+const LOG_MAX_BYTES = 512 * 1024
 // Durable, machine-scoped pairing lives outside TEMP: a phone pairs once and
 // keeps working across reboots and across every opencode instance.
 const MACHINE_DIR = join(homedir(), ".config", "opencode", "remote-control")
@@ -84,6 +88,17 @@ const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>
 function persistRegistrations(regs: RemoteState[]) {
   mkdirSync(STATE_DIR, { recursive: true })
   writeFileSync(STATE_FILE, JSON.stringify({ updatedAt: Date.now(), registrations: regs }, null, 2))
+}
+
+function log(message: string): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    if (existsSync(LOG_FILE) && readFileSync(LOG_FILE).length > LOG_MAX_BYTES) writeFileSync(LOG_FILE, "")
+    appendFileSync(LOG_FILE, `${new Date().toISOString()} pid=${process.pid} ${message}
+`)
+  } catch {
+    /* diagnostics must never break the tool */
+  }
 }
 
 function loadRegistrations(): RemoteState[] {
@@ -201,28 +216,6 @@ async function pruneStale(): Promise<void> {
   if (alive.length !== regs.length) persistRegistrations(alive)
 }
 
-/**
- * The tailnet root is a single contested resource: a path-less
- * `serve --bg <port>` silently REPLACES any existing root handler, which
- * would steal another instance's published URL. Only claim the root when
- * nothing publishes it yet; otherwise publish under our unique mount.
- */
-function rootMountFree(): boolean {
-  const status = tailscale(["serve", "status", "--json"])
-  if (!status.ok) return false
-  try {
-    const parsed = JSON.parse(status.out) as {
-      Web?: Record<string, { Handlers?: Record<string, unknown> }>
-    }
-    for (const host of Object.values(parsed.Web ?? {})) {
-      if (host.Handlers?.["/"] !== undefined) return false
-    }
-    return true
-  } catch {
-    return false
-  }
-}
-
 const TAILSCALE_CANDIDATES = process.platform === "win32"
   ? ["tailscale", "tailscale.exe", "C:\\Program Files\\Tailscale\\tailscale.exe"]
   : ["tailscale"]
@@ -252,10 +245,16 @@ function spawnTailscale(cmd: string, args: string[]) {
 
 function tailscale(args: string[]): { ok: boolean; out: string } {
   let last = ""
+  const startedAt = Date.now()
   for (const cmd of TAILSCALE_CANDIDATES) {
     const r = spawnTailscale(cmd, args)
-    if (!r.error && r.status === 0) return { ok: true, out: (r.stdout ?? "").trim() }
+    if (!r.error && r.status === 0) {
+      const out = (r.stdout ?? "").trim()
+      log(`tailscale ${args.join(" ")} -> ok in ${Date.now() - startedAt}ms (${out.length} bytes)`)
+      return { ok: true, out }
+    }
     last = [r.error?.message, r.stderr, r.stdout].filter(Boolean).join("\n").trim()
+    log(`tailscale ${args.join(" ")} via ${cmd} -> error=${(r.error as NodeJS.ErrnoException | undefined)?.code ?? "-"} status=${r.status} ${last.slice(0, 160).replace(/\s+/g, " ")}`)
     // Spawn failed to find this candidate (ENOENT) -> try the next one.
     // Otherwise the CLI itself reported an error -> report it as-is.
     const enoent = (r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
@@ -379,7 +378,36 @@ function liveRegistrations(): RemoteState[] {
  * reachable with the pairing token, and that must not be a way to harvest
  * every instance's credentials.
  */
+function routedPorts(): Map<string, number> | undefined {
+  const status = tailscale(["serve", "status", "--json"])
+  if (!status.ok) return undefined
+  try {
+    const parsed = JSON.parse(status.out) as {
+      Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }>
+    }
+    const routes = new Map<string, number>()
+    for (const host of Object.values(parsed.Web ?? {})) {
+      for (const [mount, handler] of Object.entries(host.Handlers ?? {})) {
+        const port = Number(handler.Proxy?.match(/:(\d+)$/)?.[1])
+        if (port) routes.set(mount, port)
+      }
+    }
+    return routes
+  } catch {
+    return undefined
+  }
+}
+
+// A registration is only "alive" for the app if the phone can actually reach
+// it: process up, port answering, AND tailscale still routes its mount there.
+// (A mount that was replaced by another instance is reported as down rather
+// than silently pointing the app at the wrong instance.)
+function routed(routes: Map<string, number> | undefined, mount: string, port: number): boolean {
+  return routes === undefined ? true : routes.get(mount) === port
+}
+
 async function instanceViews(): Promise<InstanceView[]> {
+  const routes = routedPorts()
   return Promise.all(
     loadRegistrations().map(async (r) => ({
       id: r.id || createHash("sha1").update(r.directory || String(r.pid)).digest("hex").slice(0, 12),
@@ -390,7 +418,7 @@ async function instanceViews(): Promise<InstanceView[]> {
       port: r.port,
       defaultSession: r.defaultSession,
       startedAt: r.startedAt,
-      alive: pidAlive(r.pid) && (await portAlive(r.port)),
+      alive: pidAlive(r.pid) && (await portAlive(r.port)) && routed(routes, r.mount || "/", r.port),
     })),
   )
 }
@@ -766,9 +794,13 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     await pruneStale()
     const tok = randomBytes(16).toString("hex")
     const port = freePort()
-    const mount = `/rc-${randomBytes(3).toString("hex")}`
+    const id = instanceId(directory)
+    // One stable path per instance. The tailnet root is never claimed: a
+    // path-less `serve --bg` silently replaces whatever holds "/", which is
+    // exactly how one instance used to steal another's URL.
+    const mount = `/rc-${id}`
     const state: RemoteState = {
-      id: instanceId(directory),
+      id,
       url: `https://PENDING/?t=${tok}`,
       token: tok,
       port,
@@ -784,28 +816,20 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
 
     server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler })
 
-    // First choice: own the tailnet root, but only when nothing already
-    // publishes it — a path-less serve would silently replace another
-    // instance's handler. Otherwise (or if the root claim fails) mount under
-    // a unique path so every instance keeps a working URL.
-    const claimRoot = rootMountFree()
-    let serve = claimRoot
-      ? tailscale(["serve", "--bg", String(port)])
-      : tailscale(["serve", "--bg", "--set-path", mount, String(port)])
-    let path = claimRoot ? "" : mount
-    if (!serve.ok && claimRoot) {
-      serve = tailscale(["serve", "--bg", "--set-path", mount, String(port)])
-      path = mount
-    }
+    log(`start id=${id} port=${port} mount=${mount} dir=${directory}`)
+    const serve = tailscale(["serve", "--bg", "--set-path", mount, String(port)])
     if (!serve.ok) {
       server.stop(true)
       server = undefined
+      log(`start failed: ${serve.out.slice(0, 200)}`)
       const enableUrl = serve.out.match(/https:\/\/login\.tailscale\.com\/f\/serve\?node=\S+/)?.[0]
       return enableUrl
-        ? `Serve is not enabled on your tailnet yet. Enable it once (one click, admin of your tailnet) at:\n${enableUrl}\nThen run /remote-control again.`
-        : `tailscale serve failed:\n${serve.out}`
+        ? `Serve is not enabled on your tailnet yet. Enable it once (one click, admin of your tailnet) at:
+${enableUrl}
+Then run /remote-control again.`
+        : `tailscale serve failed:
+${serve.out}`
     }
-    state.mount = path === "" ? "/" : mount
     const host = machineHost()
     if (!host) {
       server.stop(true)
@@ -814,7 +838,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       return "could not read tailnet hostname (tailscale status failed)"
     }
     state.host = host
-    state.url = `https://${host}${path}/?t=${tok}`
+    state.url = `https://${host}${mount}/?t=${tok}`
     activeState = state
     const regs = loadRegistrations().filter((r) => r.pid !== process.pid)
     regs.push(state)
@@ -851,12 +875,15 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     if (!startedHere) return "Remote Control was not active in this process."
     startedHere = false
     // Our mount is known in memory — never trust the shared file for this.
-    const mount = activeState?.mount ?? "/"
+    const mount = activeState?.mount
     activeState = undefined
     persistRegistrations(loadRegistrations().filter((r) => r.pid !== process.pid))
-    // Targeted removal of OUR mount only — never reset other instances' mounts.
-    let r = tailscale(["serve", "--set-path", mount, "off"])
-    if (!r.ok && mount === "/") r = tailscale(["serve", "reset"])
+    log(`stop mount=${mount ?? "-"}`)
+    // Targeted removal of OUR path only. The root is never ours to remove.
+    const r =
+      mount !== undefined && mount.startsWith("/rc-")
+        ? tailscale(["serve", "--set-path", mount, "off"])
+        : { ok: true, out: "" }
     // The hub mount is shared: it goes away only with the last instance.
     if (liveRegistrations().length === 0) void tailscale(["serve", "--set-path", HUB_MOUNT, "off"])
     return r.ok ? "Remote Control off. Local session unaffected." : `Remote Control off, but tailscale removal failed: ${r.out}`
