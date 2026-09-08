@@ -133,6 +133,7 @@ machine pairing token via `?t=`, the `x-oc-token` header, or Basic
 | `POST /session/:id/permissions/:permissionID` | permission response (`{ response }`) |
 | `GET /config/providers` | `config.providers` — every provider with its `models` map |
 | `GET /agent` | `app.agents` — every agent (`name`, `description`, `mode`, `model`) |
+| `GET /command` | `command.list` — every command (`name`, `description`, `template`, `source`, optional `agent`/`model`) |
 | `GET /event` | live SSE feed of every SDK event |
 | `GET /question` | `GET /question` — pending question requests for this instance |
 | `POST /question/:id/reply` | question reply (`{ answers: string[][] }`) |
@@ -163,6 +164,27 @@ POST /session/:id/prompt_async
 
 A selector missing either half is dropped rather than forwarded, so a partly
 filled picker falls back to the instance default instead of failing the prompt.
+
+#### Listing commands
+
+`GET /command` returns the catalogue the TUI's command menu is built from, so a
+client can offer `POST /session/:id/command` by picking a command instead of
+guessing its name:
+
+```
+GET /command
+[ { "name": "remote-control",
+    "description": "Toggle Remote Control (continue this session from your phone …)",
+    "agent": "build", "source": "command", "subtask": false, "hints": [],
+    "template": "Use the `remote_control` tool … Arguments: $ARGUMENTS" } ]
+```
+
+`template` is the command's prompt body — `$ARGUMENTS` marks where the argument
+string lands — and `source` says where the command came from (`command`, `mcp`,
+`skill`). Running one still goes through `POST /session/:id/command`; the
+resulting `command.executed` events (`{ name, sessionID, arguments, messageID }`)
+already flow on `GET /event` like every other event type, so nothing extra is
+needed to follow the run.
 
 #### Answering the question tool
 
