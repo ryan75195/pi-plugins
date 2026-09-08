@@ -117,6 +117,9 @@ let startedHere = false // this process actually published the tailscale serve e
 let activeState: RemoteState | undefined // this process's registration (in-memory truth)
 let eventLog: Array<{ type: string; sessionID?: string }> = []
 const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>()
+type NativeStreamSink = { write: (chunk: string) => boolean }
+// Phone / native clients on GET /event, fed by the plugin event hook.
+const nativeStreamSinks = new Set<NativeStreamSink>()
 // Live /event subscribers, counted so a leaked subscription shows up in the log
 // rather than only as quietly growing memory.
 let openEventStreams = 0
@@ -674,22 +677,25 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     // The SDK's SSE client honours `signal`: aborting it cancels the reader and
     // ends the generator, so the upstream subscription is actually released
     // instead of iterating on for a client that has gone away.
-    const upstream = new AbortController()
     let closed = false
     let keepalive: ReturnType<typeof setInterval> | undefined
+    let sink: NativeStreamSink | undefined
 
     const release = (reason: string) => {
       if (closed) return
       closed = true
       if (keepalive) clearInterval(keepalive)
       keepalive = undefined
-      upstream.abort()
+      if (sink) nativeStreamSinks.delete(sink)
       openEventStreams = Math.max(0, openEventStreams - 1)
       log(`event stream closed (${reason}) open=${openEventStreams}`)
     }
 
+    // Events come from the plugin's own `event` hook (see the bottom of this
+    // file), NOT from client.event.subscribe(): inside a TUI-hosted instance
+    // that SDK subscription never yields, while the hook fires in every mode.
     const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
+      start(controller) {
         openEventStreams++
         log(`event stream opened open=${openEventStreams}`)
         const write = (chunk: string): boolean => {
@@ -699,28 +705,21 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
             return true
           } catch {
             release("write failed")
+            try {
+              controller.close()
+            } catch {
+              /* already closed */
+            }
             return false
           }
         }
+        sink = { write }
+        nativeStreamSinks.add(sink)
         write("retry: 3000\n\n")
+        write(`data: ${JSON.stringify({ directory, payload: { type: "server.connected", properties: {} } })}\n\n`)
         // tailscale serve (and any proxy in between) drops a stream that goes
         // quiet. A comment frame keeps it warm and every SSE parser ignores it.
         keepalive = setInterval(() => write(": ping\n\n"), SSE_KEEPALIVE_MS)
-        try {
-          const sub = await client.event.subscribe({ signal: upstream.signal })
-          for await (const event of sub.stream) {
-            if (closed) break
-            if (!write(`data: ${JSON.stringify({ directory, payload: event })}\n\n`)) break
-          }
-        } catch {
-          write("event: error\ndata: {}\n\n")
-        }
-        release("upstream ended")
-        try {
-          controller.close()
-        } catch {
-          /* already closed */
-        }
       },
       cancel() {
         release("client disconnected")
@@ -1064,6 +1063,12 @@ ${serve.out}`
       }),
     },
     event: async ({ event }) => {
+      if (nativeStreamSinks.size > 0) {
+        const frame = `data: ${JSON.stringify({ directory, payload: event })}\n\n`
+        for (const sink of nativeStreamSinks) {
+          if (!sink.write(frame)) nativeStreamSinks.delete(sink)
+        }
+      }
       if (!event.type.startsWith("message") && !event.type.startsWith("session")) return
       const sid = (event.properties as { sessionID?: string } | undefined)?.sessionID
       eventLog.push({ type: event.type, sessionID: sid })
