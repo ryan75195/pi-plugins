@@ -134,6 +134,9 @@ machine pairing token via `?t=`, the `x-oc-token` header, or Basic
 | `GET /config/providers` | `config.providers` — every provider with its `models` map |
 | `GET /agent` | `app.agents` — every agent (`name`, `description`, `mode`, `model`) |
 | `GET /event` | live SSE feed of every SDK event |
+| `GET /question` | `GET /question` — pending question requests for this instance |
+| `POST /question/:id/reply` | question reply (`{ answers: string[][] }`) |
+| `POST /question/:id/reject` | question reject (no body) |
 
 #### Choosing a model or an agent
 
@@ -161,6 +164,44 @@ POST /session/:id/prompt_async
 A selector missing either half is dropped rather than forwarded, so a partly
 filled picker falls back to the instance default instead of failing the prompt.
 
+#### Answering the question tool
+
+When the assistant calls the **question** tool it stops and waits: the turn stays
+blocked until the request is answered or rejected. A remote client that cannot do
+either strands the session, so all three routes are proxied.
+
+```
+GET /question
+[ { "id": "que_01ab…", "sessionID": "ses_…",
+    "questions": [ { "question": "Which colour do you prefer?", "header": "Colour",
+                     "options": [ { "label": "Red", "description": "" },
+                                  { "label": "Blue", "description": "" } ],
+                     "multiple": false, "custom": false } ],
+    "tool": { "messageID": "msg_…", "callID": "call_…" } } ]
+
+POST /question/que_01ab…/reply    { "answers": [["Blue"]] }   → {}
+POST /question/que_01ab…/reject                               → {}
+```
+
+`answers` is one array of chosen option **labels** per question, in the order
+`questions` lists them (an array per question because `multiple: true` allows
+several labels). A body whose `answers` is not an array of string arrays is a
+400 from the plugin rather than an upstream error; unknown request ids come back
+with the server's own 4xx.
+
+These are the plain v1 question routes on the local opencode server — the plugin
+proxies them with `fetch` against its own `serverUrl`, because the v1
+`OpencodeClient` the plugin is handed has no `question` namespace in any
+published SDK version (only `@opencode-ai/sdk/v2` does).
+
+The matching events arrive on `GET /event` like every other event type:
+
+```
+question.asked     properties = the QuestionRequest above
+question.replied   { sessionID, requestID, answers }
+question.rejected  { sessionID, requestID }
+```
+
 #### Attaching a file to a prompt
 
 A `parts` entry is either a text part or a file part; every other kind (and any
@@ -185,7 +226,7 @@ data: {"directory":"C:\\path\\to\\project","payload":{"id":"evt_…","type":"mes
 
 Every event type is forwarded untouched (`message.updated`,
 `message.part.updated`, `session.status`, `session.idle`, `permission.*`,
-`session.*`); filtering is the client's job. The stream sends `retry: 3000`
+`question.*`, `session.*`); filtering is the client's job. The stream sends `retry: 3000`
 first and a `: ping` comment every 15 s, because `tailscale serve` (and any
 proxy in between) drops a stream that goes quiet. When the client disconnects,
 the upstream SDK subscription is aborted rather than left iterating; open and

@@ -10,12 +10,12 @@
     "install:opencode": "node scripts/install-opencode.js"
   },
   "devDependencies": {
-    "@types/node": "^24",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "@opencode-ai/plugin": "latest",
-    "@opencode-ai/sdk": "latest",
+    "@opencode-ai/plugin": "^1.18.29",
+    "@opencode-ai/sdk": "^1.18.29",
+    "@types/node": "^24",
     "typebox": "*",
     "typescript": "^5"
   },

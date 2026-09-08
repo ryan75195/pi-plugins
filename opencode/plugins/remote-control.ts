@@ -145,6 +145,24 @@ function pickCommandModel(value: unknown): string | undefined {
   return model ? `${model.providerID}/${model.modelID}` : undefined
 }
 
+/**
+ * Answers to a question request are one array of chosen option labels per
+ * question, in the order the request listed them. Anything that is not a
+ * string[][] is refused here rather than forwarded: opencode blocks the whole
+ * turn on a pending question, and a malformed reply would leave it blocked
+ * behind an upstream 500 the client cannot act on.
+ */
+function pickAnswers(value: unknown): string[][] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const answers: string[][] = []
+  for (const row of value) {
+    if (!Array.isArray(row)) return undefined
+    if (!row.every((label) => typeof label === "string")) return undefined
+    answers.push(row as string[])
+  }
+  return answers
+}
+
 let server: ReturnType<typeof Bun.serve> | undefined
 let startedHere = false // this process actually published the tailscale serve entry
 let activeState: RemoteState | undefined // this process's registration (in-memory truth)
@@ -673,7 +691,7 @@ inbox.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefa
 loadSessions();
 </script></body></html>`
 
-export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
+export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   async function listSessions(): Promise<SessionRow[]> {
     const result = await client.session.list({ query: { directory } })
     const rows = (result.data ?? []) as Array<Record<string, unknown>>
@@ -764,6 +782,31 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
     })
   }
 
+  /**
+   * The question tool is newer than the SDK surface this plugin builds against:
+   * `client` is the v1 OpencodeClient, and no published version of it carries a
+   * `question` namespace — only `@opencode-ai/sdk/v2` does, behind a subpath a
+   * plugin cannot count on resolving inside opencode's loader. `serverUrl` is
+   * the very opencode server this plugin runs inside, so the question routes are
+   * proxied with a plain fetch against the same paths the v2 client would call,
+   * status and body passed straight through like the SDK-backed routes.
+   */
+  async function questionProxy(path: string, body?: unknown): Promise<Response> {
+    const base = serverUrl.href.endsWith("/") ? serverUrl.href : serverUrl.href + "/"
+    const target = new URL(path, base)
+    target.searchParams.set("directory", directory)
+    const upstream = await fetch(target, {
+      method: body === undefined ? "GET" : "POST",
+      ...(body === undefined
+        ? {}
+        : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+    })
+    return new Response(await upstream.text(), {
+      status: upstream.status,
+      headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+    })
+  }
+
   function makeHandler(tok: string, getState: () => RemoteState | undefined) {
     const sdk = async (
       run: () => Promise<{ data?: unknown; error?: unknown; response?: { status?: number } }>,
@@ -786,7 +829,13 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
       // app) can manage this TUI's sessions through the tunnel. Auth: Basic
       // opencode:<token> or ?t=/x-oc-token.
       const parts = seg.split("/").filter(Boolean)
-      if (parts[0] === "session" || seg === "/event" || seg === "/config/providers" || seg === "/agent") {
+      if (
+        parts[0] === "session" ||
+        parts[0] === "question" ||
+        seg === "/event" ||
+        seg === "/config/providers" ||
+        seg === "/agent"
+      ) {
         try {
           if (seg === "/event" && req.method === "GET") return eventStream()
           // The model and agent catalogues, so a remote client can render a
@@ -799,6 +848,27 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
           }
           if (seg === "/agent" && req.method === "GET") {
             return sdk(() => client.app.agents({ query: { directory } }))
+          }
+          // The question tool. The assistant blocks until a request is answered
+          // or rejected, so a remote client needs all three routes or a question
+          // asked over the tunnel strands the session with no way out. The
+          // matching `question.asked` / `question.replied` / `question.rejected`
+          // events already reach clients on /event, which forwards every event
+          // type untouched.
+          if (parts[0] === "question") {
+            if (parts.length === 1 && req.method === "GET") return questionProxy("question")
+            const requestID = parts[1]
+            if (requestID && parts.length === 3 && req.method === "POST") {
+              const target = "question/" + encodeURIComponent(requestID) + "/" + parts[2]
+              if (parts[2] === "reject") return questionProxy(target, {})
+              if (parts[2] === "reply") {
+                const body = (await req.json().catch(() => ({}))) as { answers?: unknown }
+                const answers = pickAnswers(body.answers)
+                if (!answers) return json({ error: "answers must be an array of string arrays" }, 400)
+                return questionProxy(target, { answers })
+              }
+            }
+            return json({ error: "not found" }, 404)
           }
           if (parts[0] !== "session") return json({ error: "not found" }, 404)
           if (parts.length === 1) {
