@@ -1202,15 +1202,25 @@ ${serve.out}`
   return {
     tool: {
       remote_control: tool({
-        description:
-          "Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet. Actions: 'toggle' turns it off if it is on, on if it is off — use this for a bare /remote-control. 'on' forces registration, 'off' unregisters, 'status' reports state. 'pair' prints the one-time pair URL for the phone app (a machine-level token, valid for every instance on this machine); 'rotate-pairing' mints a new pairing token and invalidates the old one.",
+        description: `Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet.
+
+This tool backs the /remote-control command — always call it, never answer from memory. Map the command's argument words to \`action\`:
+- empty, "toggle" → toggle (connects when off, disconnects when on)
+- "on", "start" → on
+- "off", "stop", "disconnect", "unregister" → off
+- "status" → status
+- "pair" → pair (prints the machine pair URL to paste into the phone app once)
+- "rotate-pairing", "rotate" → rotate-pairing (mints a new pairing token; the old one stops working, so the app has to be re-paired)
+Any other argument is a display name: pass it as \`name\` with action toggle (a name is only meaningful when connecting).
+
+Report the tool output verbatim — especially the URL and any enable link. Never invent or modify the URL. If the output says Serve is not enabled, tell the user to click the enable link first.`,
         args: {
           action: tool.schema
             .enum(["toggle", "on", "off", "status", "pair", "rotate-pairing"])
             .describe(
-              "toggle = flip on/off (default for /remote-control), on = register, off = unregister, status = report, pair = print the machine pair URL for the app, rotate-pairing = mint a new pairing token",
+              "toggle = flip on/off (default for a bare /remote-control), on = register, off = unregister, status = report, pair = print the machine pair URL for the app, rotate-pairing = mint a new pairing token and invalidate the old one",
             ),
-          name: tool.schema.string().optional().describe("optional display name shown in the remote session list"),
+          name: tool.schema.string().optional().describe("optional display name shown in the remote session list; only meaningful when connecting"),
         },
         async execute(args, context) {
           if (args.action === "toggle") return server ? stop() : start(args.name || undefined, context.sessionID)

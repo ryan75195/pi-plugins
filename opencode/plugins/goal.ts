@@ -331,10 +331,14 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 
 		tool: {
 			goal_set: tool({
-				description:
-					"Set a completion condition for this session. The agent keeps working toward it automatically: after every turn an evaluator model checks the condition and continues the loop until it is met, impossible, or paused for lack of progress. The condition should be verifiable from the conversation (e.g. 'all tests in test/auth pass', 'git status is clean').",
+				description: `Set a completion condition for this session. The agent keeps working toward it automatically: after every turn an evaluator model checks the condition and continues the loop until it is met, impossible, or paused for lack of progress. The condition should be verifiable from the conversation (e.g. 'all tests in test/auth pass', 'git status is clean').
+
+This tool backs the /goal command whenever its arguments are anything other than empty, "status", or a clear word. Never simulate the goal and never just do the work without setting it. Follow this order EXACTLY:
+- FIRST tool call: goal_set with the arguments as the condition. Do nothing else before it — no analysis, no file reads, no writes.
+- THEN work toward the condition. After each of your turns an evaluator checks it automatically; if it is not yet met you receive guidance as a message — continue working immediately without asking the user.
+- Only stop when the evaluator reports MET, or the goal is paused/cleared.`,
 				args: {
-					condition: tool.schema.string().describe("The completion condition, verifiable from the conversation. Max 4000 chars."),
+					condition: tool.schema.string().describe("The completion condition, verifiable from the conversation, taken from the /goal arguments. Max 4000 chars."),
 				},
 				async execute(args, context) {
 					if (!args.condition.trim()) throw new Error("Condition must not be empty")
@@ -357,7 +361,9 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 			}),
 
 			goal_status: tool({
-				description: "Report the current /goal state for this session: condition, runtime, turns evaluated, last evaluator reason.",
+				description: `Report the current /goal state for this session: condition, runtime, turns evaluated, last evaluator reason.
+
+This is the /goal branch for empty arguments or "status". Report the output verbatim.`,
 				args: {},
 				async execute(_args, context) {
 					const goal = goals.get(context.sessionID)
@@ -374,7 +380,9 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 			}),
 
 			goal_clear: tool({
-				description: "Clear the active /goal for this session.",
+				description: `Clear the active /goal for this session.
+
+This is the /goal branch for the argument words "clear", "stop", "off", "reset", "none" and "cancel". Report the output.`,
 				args: {},
 				async execute(_args, context) {
 					const goal = goals.get(context.sessionID)

@@ -29,7 +29,7 @@ session via `prompt_async`:
 - **Cleanup**: kill the process when stopping; Windows kills the whole process tree.
 - **Environment**: children receive `OPENCODE_BG_TASK_ID`.
 - No live task panel in the chat area, BUT: a **TUI sidebar section** ([tui/background-tasks-sidebar.tsx](tui/background-tasks-sidebar.tsx)) renders running/finished tasks in the right-hand panel (`ctrl+x b`), with live elapsed times and click-to-stop (confirmation dialog). Pairs with the server plugin via a shared state file.
-- **`/processes` command** ([commands/processes.md](commands/processes.md), install to `~/.config/opencode/commands/`): appears in the TUI command menu. Shows a compact status table via `task_list`; supports `stop <id>`, `view <id>`, `stop all` arguments.
+- **`/processes` command** ([commands/processes.md](commands/processes.md), install to `~/.config/opencode/commands/`): appears in the TUI command menu. Shows a compact status table via `task_list`; supports `stop <id>`, `view <id>`, `stop all` arguments. The table format and argument handling live in the `task_list` / `task_stop` / `task_output` tool descriptions, not the template — see [Command templates](#command-templates).
 
 ## Install
 
@@ -95,7 +95,8 @@ running locally; the remote client is a window into it.
   `tailscale serve --bg` (tailnet-only, never public; token-gated on top).
 - `opencode/commands/remote-control.md` — `/remote-control [name]`, `off`, `status`.
 
-Every instance publishes under its own stable `/rc-<instance id>` path; the tailnet root is never claimed, so instances cannot replace each other's URL. Diagnostics: `%TEMP%\opencode-remoteemote-control.log` records every tailscale call and registration decision.
+Every instance publishes under its own stable `/rc-<instance id>` path; the tailnet root is never claimed, so instances cannot replace each other's URL. Diagnostics: `%TEMP%\opencode-remote
+emote-control.log` records every tailscale call and registration decision.
 
 Setup: enable Tailscale Serve once (the plugin prints the enable link if it is
 not on). Requires `tailscale` on PATH. Install with `npm run install:opencode`
@@ -318,3 +319,28 @@ copied. These are **copies, not symlinks**, so:
 
 > Run `npm run install:opencode` after every merge, then restart running
 > opencode instances to pick up the new code.
+
+## Command templates
+
+opencode injects a command's template file into the conversation as the
+**user** message, so whatever the template says is what the TUI (and any
+client) paints where a short user turn should be. Every command in
+`opencode/commands/` is therefore a single line:
+
+```
+/remote-control $ARGUMENTS — use the `remote_control` tool; report its output verbatim.
+```
+
+The behaviour — argument-word mappings, the `/processes` table format, the
+`/goal` ordering rule, the `/monitor` guidance on filtered commands and
+`[monitor …]` events — lives in the `description` and arg `.describe()` text
+of the tools in `opencode/plugins/`, which the model sees on every turn:
+
+| Command | Where its rules live |
+|---|---|
+| `/remote-control` | `remote_control` in [plugins/remote-control.ts](plugins/remote-control.ts) |
+| `/monitor` | `monitor`, `monitor_stop` in [plugins/monitor.ts](plugins/monitor.ts) |
+| `/processes` | `task_list`, `task_stop`, `task_output` in [plugins/background-tasks.ts](plugins/background-tasks.ts) |
+| `/goal` | `goal_set`, `goal_status`, `goal_clear` in [plugins/goal.ts](plugins/goal.ts) |
+
+Change a command's behaviour in the tool description, not the template.
