@@ -401,10 +401,13 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
   return {
     tool: {
       monitor: tool({
-        description:
-          "Start a background watch and stream its output into this session as events, so you can react mid-conversation. Use it to tail logs and flag errors, poll CI/PR status until it changes, watch a directory via a script, or connect to a WebSocket feed. Provide either `command` (its stdout lines become events — make the script print only what matters) or `ws_url`. The watch ends at the deadline unless persistent; deliver at most a bounded number of events, then it ends to protect context.",
+        description: `Start a background watch and stream its output into this session as events, so you can react mid-conversation. Use it to tail logs and flag errors, poll CI/PR status until it changes, watch a directory via a script, or connect to a WebSocket feed. Provide either \`command\` (its stdout lines become events) or \`ws_url\`. The watch ends at the deadline unless persistent; deliver at most a bounded number of events, then it ends to protect context.
+
+This tool backs the /monitor command. Given a thing to watch, call it with a \`command\` that prints ONLY the interesting lines — filter inside the command with grep/Select-String/tail as appropriate — a short \`description\`, and a \`pattern\` when the user names a specific thing to match (e.g. READY, error). For polling (CI, PRs, URLs) write a loop command that prints one line per state change, not a line per poll. Prefer \`persistent\` only when the user asks for indefinite watching. With no argument at all, do not start anything: say you can list or stop watches, name the ids of any watch started this session, and ask what they want watched.
+
+When \`[monitor …]\` event messages arrive later in the conversation, treat them as real events: report or act on them immediately, without re-running the watch command.`,
         args: {
-          command: tool.schema.string().optional().describe("shell command to run in the background; each stdout line becomes an event. Mutually exclusive with ws_url."),
+          command: tool.schema.string().optional().describe("shell command to run in the background; each stdout line becomes an event, so make it print only what matters. Mutually exclusive with ws_url."),
           ws_url: tool.schema.string().optional().describe("ws:// or wss:// URL; each text message becomes an event. Mutually exclusive with command."),
           ws_protocols: tool.schema.string().optional().describe("comma-separated WebSocket subprotocols to offer"),
           description: tool.schema.string().describe("short label shown in every event, e.g. 'dev server log' or 'CI status'"),
@@ -418,7 +421,9 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
       }),
 
       monitor_stop: tool({
-        description: "Cancel one background watch started with the monitor tool, or all of them. Watches also end on their deadline, when their command exits, or when the session ends.",
+        description: `Cancel one background watch started with the monitor tool, or all of them. Watches also end on their deadline, when their command exits, or when the session ends.
+
+This is the /monitor branch for the argument words "stop", "off" and "cancel": pass the id given in the arguments, or \`all\` when none is given.`,
         args: {
           id: tool.schema.string().optional().describe("watch id from the monitor result; omit or use 'all' to stop every active watch"),
         },

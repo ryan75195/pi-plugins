@@ -615,9 +615,9 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			}),
 
 			task_output: tool({
-				description:
-					"Get the status and output of a background task. Set block:true to wait for completion (up to timeout_ms, default 30s). " +
-					"Returns the last tail_bytes of output (default 4096) plus status, exit code and duration.",
+				description: `Get the status and output of a background task. Set block:true to wait for completion (up to timeout_ms, default 30s). Returns the last tail_bytes of output (default 4096) plus status, exit code and duration.
+
+This is the /processes branch for \`view <id>\` and \`out <id>\`: call it with block: true and show the output.`,
 				args: {
 					task_id: tool.schema.string().describe("The task ID returned by bash_background"),
 					block: tool.schema.boolean().optional().describe("Wait for the task to finish before returning (default false)"),
@@ -641,7 +641,9 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			}),
 
 			task_stop: tool({
-				description: "Stop a running background task. Kills the entire process tree.",
+				description: `Stop a running background task. Kills the entire process tree.
+
+This is the /processes branch for \`stop <id>\` (or a bare id of a running task). For \`stop all\` / \`kill all\`, call it once per running task, then task_list to show the updated table.`,
 				args: {
 					task_id: tool.schema.string().describe("The task ID returned by bash_background"),
 				},
@@ -657,7 +659,23 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			}),
 
 			task_list: tool({
-				description: "List all background tasks from this session with status, exit codes and output file paths.",
+				description: `List all background tasks from this session with status, exit codes and output file paths.
+
+This tool backs the /processes command. After calling it, render a compact status table and nothing else:
+
+\`\`\`
+ID       STATUS     TIME     COMMAND
+✔ a1b2c3 completed  2.1s     echo hello
+▶ d4e5f6 running    1m12s    npm run dev
+\`\`\`
+
+- Status icons: ▶ running, ✔ completed, ■ stopped, ✘ failed.
+- For failed/stopped tasks, include the exit code.
+- If there are no tasks, reply with the single line "No background processes running."
+- Then one line of available actions: \`stop <id>\` to kill a task, \`view <id>\` to show its output.
+- Keep the whole response to the table plus at most two short lines.
+
+/processes arguments: \`stop <id>\` (or a bare id of a running task) → task_stop then task_list and show the updated table; \`view <id>\` or \`out <id>\` → task_output with block: true and show the output; \`kill all\` / \`stop all\` → task_stop every running task, then show the table.`,
 				args: {},
 				async execute() {
 					if (tasks.size === 0) return "No background tasks have been started this session."
