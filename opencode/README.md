@@ -125,8 +125,9 @@ machine pairing token via `?t=`, the `x-oc-token` header, or Basic
 | `GET /session` | `session.list` |
 | `POST /session` | `session.create` (`{ title? }`) |
 | `GET /session/status` | `session.status` |
+| `PATCH /session/:id` | `session.update` (`{ title }`) — rename; a blank title is a 400 |
 | `GET /session/:id/message` | `session.messages` (optional `?limit=`) |
-| `POST /session/:id/prompt_async` | `session.promptAsync` (`{ parts: [{ type: "text", text }], model?, agent? }`) |
+| `POST /session/:id/prompt_async` | `session.promptAsync` (`{ parts: [text or file], model?, agent? }`) |
 | `POST /session/:id/abort` | `session.abort` — stops the turn in flight |
 | `POST /session/:id/command` | `session.command` (`{ command, arguments, model?, agent? }`) |
 | `POST /session/:id/permissions/:permissionID` | permission response (`{ response }`) |
@@ -159,6 +160,21 @@ POST /session/:id/prompt_async
 
 A selector missing either half is dropped rather than forwarded, so a partly
 filled picker falls back to the instance default instead of failing the prompt.
+
+#### Attaching a file to a prompt
+
+A `parts` entry is either a text part or a file part; every other kind (and any
+malformed entry) is dropped rather than failing the prompt:
+
+```
+{ "type": "text", "text": "..." }
+{ "type": "file", "mime": "image/png", "url": "data:image/png;base64,...", "filename": "shot.png" }
+```
+
+`url` is passed to opencode untouched, so a `data:` URL (how a photo off a
+phone arrives) and a `file://` path both work. `filename` is optional. Whether
+the model can actually read an image depends on the model — `GET
+/config/providers` reports `capabilities.input.image` per model.
 
 `GET /event` emits opencode's **`/global/event` frame shape**, not the bare SDK
 event — the client reads `payload`:

@@ -18,6 +18,7 @@
  * gated on top of tailnet scoping.
  */
 import type { Plugin } from "@opencode-ai/plugin"
+import type { FilePartInput, TextPartInput } from "@opencode-ai/sdk"
 import { tool } from "@opencode-ai/plugin"
 import { createHash, randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
@@ -98,6 +99,38 @@ function pickAgent(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined
   const agent = value.trim()
   return agent.length > 0 ? agent : undefined
+}
+
+/**
+ * Prompt parts arrive from an untrusted client, so each one is rebuilt field by
+ * field rather than forwarded wholesale: only `text` and `file` survive, and
+ * anything malformed or of another kind is dropped instead of failing the whole
+ * prompt. A file part's `url` is whatever opencode itself accepts — a `data:`
+ * URL is how a photo off a phone arrives, a `file://` path how a local
+ * attachment does.
+ */
+function pickPromptParts(value: unknown): Array<TextPartInput | FilePartInput> {
+  if (!Array.isArray(value)) return []
+  const parts: Array<TextPartInput | FilePartInput> = []
+  for (const raw of value) {
+    if (typeof raw !== "object" || raw === null) continue
+    const { type, text, mime, url, filename } = raw as Record<string, unknown>
+    if (type === "text") {
+      if (typeof text === "string" && text.length > 0) parts.push({ type: "text", text })
+      continue
+    }
+    if (type === "file") {
+      if (typeof mime !== "string" || mime.length === 0) continue
+      if (typeof url !== "string" || url.length === 0) continue
+      parts.push({
+        type: "file",
+        mime,
+        url,
+        ...(typeof filename === "string" && filename.length > 0 ? { filename } : {}),
+      })
+    }
+  }
+  return parts
 }
 
 // session.command names the model with a single "provider/model" string rather
@@ -778,6 +811,16 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
           if (parts.length === 2 && parts[1] === "status" && req.method === "GET") {
             return sdk(() => client.session.status({ query: { directory } }))
           }
+          // Rename. The SDK's session.update takes a partial session, but the
+          // only field worth exposing to a remote client is the title, and a
+          // blank one is rejected here rather than quietly clearing it.
+          if (parts.length === 2 && req.method === "PATCH") {
+            const id = parts[1]
+            const body = (await req.json().catch(() => ({}))) as { title?: unknown }
+            const title = typeof body.title === "string" ? body.title.trim() : ""
+            if (title.length === 0) return json({ error: "title required" }, 400)
+            return sdk(() => client.session.update({ path: { id }, body: { title }, query: { directory } }))
+          }
           if (parts.length >= 3) {
             const id = parts[1]
             if (parts[2] === "message" && req.method === "GET") {
@@ -791,16 +834,17 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory }) => {
             }
             if (parts[2] === "prompt_async" && req.method === "POST") {
               const body = (await req.json().catch(() => ({}))) as {
-                parts?: Array<{ type: "text"; text: string }>
+                parts?: unknown
                 model?: unknown
                 agent?: unknown
               }
+              const promptParts = pickPromptParts(body.parts)
               const model = pickModel(body.model)
               const agent = pickAgent(body.agent)
               return sdk(() =>
                 client.session.promptAsync({
                   path: { id },
-                  body: { parts: body.parts ?? [], ...(model ? { model } : {}), ...(agent ? { agent } : {}) },
+                  body: { parts: promptParts, ...(model ? { model } : {}), ...(agent ? { agent } : {}) },
                   query: { directory },
                 }),
               )
