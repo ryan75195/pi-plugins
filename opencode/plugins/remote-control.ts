@@ -895,7 +895,8 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
         parts[0] === "question" ||
         seg === "/event" ||
         seg === "/config/providers" ||
-        seg === "/agent"
+        seg === "/agent" ||
+        seg === "/command"
       ) {
         try {
           if (seg === "/event" && req.method === "GET") return eventStream()
@@ -909,6 +910,14 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
           }
           if (seg === "/agent" && req.method === "GET") {
             return sdk(() => client.app.agents({ query: { directory } }))
+          }
+          // The catalogue behind POST /session/:id/command. Without it a remote
+          // client has to know a command's name up front, so it cannot offer a
+          // command menu at all. Returned untouched like the other catalogues:
+          // every entry carries its own `template`, `source` and optional
+          // agent/model overrides, and reshaping here would only date the client.
+          if (seg === "/command" && req.method === "GET") {
+            return sdk(() => client.command.list({ query: { directory } }))
           }
           // The question tool. The assistant blocks until a request is answered
           // or rejected, so a remote client needs all three routes or a question
