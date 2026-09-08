@@ -809,23 +809,59 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
    * proxied with a plain fetch against the same paths the v2 client would call,
    * status and body passed straight through like the SDK-backed routes.
    */
+  /**
+   * The SDK the plugin builds against has no `question` namespace, and inside
+   * a TUI-hosted (or `opencode run`) instance `serverUrl` points at a port
+   * nothing listens on: the server lives in-process. The runtime client does
+   * expose its underlying transport as `_client` (get/post over the same
+   * in-process fetch every other SDK call uses), so the question routes ride
+   * on that, with a plain fetch against `serverUrl` as the fallback for
+   * `opencode serve`, where the port is real. Never throws: an escaping
+   * handler error has killed a TUI process before.
+   */
+  type InnerResult = { data?: unknown; error?: unknown; response?: { status?: number } }
+  type InnerClient = {
+    get: (o: { url: string; query?: Record<string, unknown> }) => Promise<InnerResult>
+    post: (o: { url: string; query?: Record<string, unknown>; body?: unknown }) => Promise<InnerResult>
+  }
+  const inner = (client as unknown as { _client?: InnerClient })._client
+
+  async function questionViaInner(path: string, body: unknown | undefined): Promise<Response> {
+    if (!inner) throw new Error("no inner client")
+    const url = `/${path}`
+    const res =
+      body === undefined
+        ? await inner.get({ url, query: { directory } })
+        : await inner.post({ url, query: { directory }, body })
+    const status = res.response?.status ?? (res.error !== undefined && res.error !== null ? 500 : 200)
+    if (res.error !== undefined && res.error !== null) return json(res.error, status)
+    return json(res.data ?? true, status)
+  }
+
+  async function questionViaFetch(path: string, body: unknown | undefined): Promise<Response> {
+    const base = serverUrl.href.endsWith("/") ? serverUrl.href : serverUrl.href + "/"
+    const target = new URL(path, base)
+    target.searchParams.set("directory", directory)
+    const upstream = await fetch(target, {
+      method: body === undefined ? "GET" : "POST",
+      ...(body === undefined
+        ? {}
+        : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+    })
+    return new Response(await upstream.text(), {
+      status: upstream.status,
+      headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+    })
+  }
+
   async function questionProxy(path: string, body?: unknown): Promise<Response> {
-    // Never let this throw: inside a TUI-hosted instance an escaping handler
-    // error has taken the whole process down. Unreachable server -> 502.
     try {
-      const base = serverUrl.href.endsWith("/") ? serverUrl.href : serverUrl.href + "/"
-      const target = new URL(path, base)
-      target.searchParams.set("directory", directory)
-      const upstream = await fetch(target, {
-        method: body === undefined ? "GET" : "POST",
-        ...(body === undefined
-          ? {}
-          : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-      })
-      return new Response(await upstream.text(), {
-        status: upstream.status,
-        headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
-      })
+      return await questionViaInner(path, body)
+    } catch (innerError) {
+      log(`question inner transport failed for ${path}: ${String(innerError).slice(0, 120)}`)
+    }
+    try {
+      return await questionViaFetch(path, body)
     } catch (e) {
       log(`question proxy failed for ${path} via ${serverUrl?.href ?? "-"}: ${String(e).slice(0, 160)}`)
       return json({ error: "question routes unavailable on this instance" }, 502)
