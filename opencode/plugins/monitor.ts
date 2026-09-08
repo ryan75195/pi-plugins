@@ -167,6 +167,9 @@ function privateIP(ip: string): boolean {
   return true
 }
 
+const MONITOR_SYSTEM_PROMPT = `Monitor (plugin primitive)
+Never sleep, poll in a loop, or re-run a command repeatedly to wait for something - a server to come up, tests or CI to finish, a log line to appear, a file to change. Start a \`monitor\` watch instead and keep the turn moving; waiting is not work. Write the watch command so it prints only the interesting lines (filter inside the command with grep/Select-String/tail) and give it a short description. \`[monitor ...]\` messages that show up later in the conversation are real events that just happened: report or act on them straight away, without re-running the watch command. Stop a watch with \`monitor_stop\` as soon as it stops being relevant.`
+
 export const MonitorPlugin: Plugin = async ({ client, directory }) => {
   const watches = new Map<string, Watch>()
 
@@ -399,6 +402,12 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
   ensureRequestPoller()
 
   return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      try {
+        if (output.system.includes(MONITOR_SYSTEM_PROMPT)) return
+        output.system.push(MONITOR_SYSTEM_PROMPT)
+      } catch {}
+    },
     tool: {
       monitor: tool({
         description: `Start a background watch and stream its output into this session as events, so you can react mid-conversation. Use it to tail logs and flag errors, poll CI/PR status until it changes, watch a directory via a script, or connect to a WebSocket feed. Provide either \`command\` (its stdout lines become events) or \`ws_url\`. The watch ends at the deadline unless persistent; deliver at most a bounded number of events, then it ends to protect context.

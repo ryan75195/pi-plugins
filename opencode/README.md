@@ -47,17 +47,26 @@ cp /path/to/pi-plugins/opencode/plugins/background-tasks.ts .opencode/plugins/
 
 No config needed — files in the plugin directory load automatically at startup.
 
-### Global agent policy (AGENTS.md)
+### Global agent policy (system prompt injection)
 
-`AGENTS.md` in this directory tells every opencode session to reach for
-`monitor` instead of sleep/poll loops and to prefer `bash_background` for
-long-running processes. Install it globally with the rest:
+The decision rules for these primitives are not in an AGENTS.md file, where
+they compete with project rules and get drowned out. Every plugin registers
+opencode's `experimental.chat.system.transform` hook and pushes one compact
+section onto the system prompt on every turn, so the model knows the primitives
+as first-class capabilities rather than as documentation it might have read:
 
-```bash
-cp /path/to/pi-plugins/opencode/AGENTS.md ~/.config/opencode/AGENTS.md
-```
+| Plugin | Section |
+|---|---|
+| [plugins/background-tasks.ts](plugins/background-tasks.ts) | `Background tasks (plugin primitive)` — anything that keeps running goes through `bash_background`; completion arrives as a message, don't poll. |
+| [plugins/monitor.ts](plugins/monitor.ts) | `Monitor (plugin primitive)` — never sleep or poll in a loop; start a filtered `monitor` watch and act on `[monitor …]` events. |
+| [plugins/goal.ts](plugins/goal.ts) | `Goal (plugin primitive)` — a stated completion condition makes `goal_set` the first tool call; work until the evaluator says MET. |
+| [plugins/remote-control.ts](plugins/remote-control.ts) | `Remote control (plugin primitive)` — what `remote_control` does, its actions, and reporting URLs verbatim. |
 
-(Existing global AGENTS.md: merge the two sections instead of overwriting.)
+Each push is guarded (skipped if the same section is already in `output.system`)
+and wrapped in try/catch, so a repeated hook call cannot duplicate the text and
+a failure here can never break a turn. `AGENTS.md` in this directory is kept
+only as a pointer to this mechanism; nothing needs to be copied to
+`~/.config/opencode/AGENTS.md` for the primitives to be known.
 
 ## Sidebar (TUI) install
 
