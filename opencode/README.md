@@ -61,21 +61,39 @@ cp /path/to/pi-plugins/opencode/AGENTS.md ~/.config/opencode/AGENTS.md
 
 ## Sidebar (TUI) install
 
-The sidebar plugin renders a live "Background tasks" section in opencode's right-hand panel:
+The TUI plugins render live sections in opencode's right-hand panel:
+
+| File | Section |
+|---|---|
+| [tui/background-tasks-sidebar.tsx](tui/background-tasks-sidebar.tsx) | "Background tasks" — running/finished tasks, click-to-stop |
+| [tui/goal-indicator.tsx](tui/goal-indicator.tsx) | "Goal" — live `/goal` condition, turns, last reason |
+| [tui/remote-control-sidebar.tsx](tui/remote-control-sidebar.tsx) | "Remote Control" — off / registered / clients connected |
+
+They are **not** copied by `npm run install:opencode`: they are registered
+from the repo by absolute path, because they resolve `solid-js` and
+`@opentui/solid` out of `opencode/tui/node_modules`.
 
 ```bash
-# 1. Dependencies for the TUI plugin (solid-js + @opentui/solid)
+# 1. Dependencies for the TUI plugins (solid-js + @opentui/solid)
 cd /path/to/pi-plugins/opencode/tui && npm install
+```
 
-# 2. Register it in ~/.config/opencode/tui.json
+```jsonc
+// 2. Register them in ~/.config/opencode/tui.json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["C:/absolute/path/to/pi-plugins/opencode/tui/background-tasks-sidebar.tsx"]
+  "plugin": [
+    "C:/absolute/path/to/pi-plugins/opencode/tui/background-tasks-sidebar.tsx",
+    "C:/absolute/path/to/pi-plugins/opencode/tui/goal-indicator.tsx",
+    "C:/absolute/path/to/pi-plugins/opencode/tui/remote-control-sidebar.tsx"
+  ]
 }
 ```
 
-Then open opencode, toggle the sidebar with `ctrl+x b`, and start a task with `bash_background` —
-it appears with a live spinner, elapsed time and exit code; click a running row to stop it.
+Then open opencode and toggle the sidebar with `ctrl+x b`. Start a task with
+`bash_background` and it appears with a live spinner, elapsed time and exit
+code (click a running row to stop it); run `/remote-control` and the Remote
+Control line switches from `off` to the instance's mount path.
 
 ## Example
 
@@ -94,6 +112,16 @@ running locally; the remote client is a window into it.
   endpoint inside the opencode server process (Bun.serve) and publishes it via
   `tailscale serve --bg` (tailnet-only, never public; token-gated on top).
 - `opencode/commands/remote-control.md` — `/remote-control [name]`, `off`, `status`.
+- `opencode/tui/remote-control-sidebar.tsx` — TUI sidebar indicator (see
+  [Sidebar (TUI) install](#sidebar-tui-install)). One quiet line while off
+  (`○ Remote Control  off · /remote-control to connect`); once registered it
+  shows the mount path, and turns green with `N clients connected` and the
+  elapsed time while a phone or browser is attached. It finds this instance's
+  registration in the shared state file by pid, else by working directory, and
+  treats a dead pid as off.
+
+The state file entry carries `clients`, the number of live native `/event`
+subscribers, refreshed (with `updatedAt`) every time a stream opens or closes.
 
 Every instance publishes under its own stable `/rc-<instance id>` path; the tailnet root is never claimed, so instances cannot replace each other's URL. Diagnostics: `%TEMP%\opencode-remote
 emote-control.log` records every tailscale call and registration decision.

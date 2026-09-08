@@ -71,6 +71,8 @@ type RemoteState = {
   defaultSession: string
   startedAt: number
   pid: number
+  clients: number // live native /event subscribers on this instance
+  updatedAt?: number
 }
 
 type SessionRow = { id: string; title?: string; updatedAt?: number }
@@ -185,6 +187,27 @@ let openEventStreams = 0
 function persistRegistrations(regs: RemoteState[]) {
   mkdirSync(STATE_DIR, { recursive: true })
   writeFileSync(STATE_FILE, JSON.stringify({ updatedAt: Date.now(), registrations: regs }, null, 2))
+}
+
+/**
+ * Mirror the live subscriber count into this process's entry so anything
+ * reading the state file — the TUI sidebar, `status` — can tell "registered"
+ * from "a phone is actually attached". Best effort by design: a failed write
+ * must never take down an event stream.
+ */
+function persistClientCount(): void {
+  try {
+    if (!activeState) return
+    activeState.clients = openEventStreams
+    activeState.updatedAt = Date.now()
+    const regs = loadRegistrations()
+    const index = regs.findIndex((r) => r.pid === process.pid)
+    if (index === -1) return
+    regs[index] = { ...regs[index], ...activeState }
+    persistRegistrations(regs)
+  } catch {
+    /* advisory only */
+  }
 }
 
 function log(message: string): void {
@@ -757,6 +780,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
       keepalive = undefined
       if (sink) nativeStreamSinks.delete(sink)
       openEventStreams = Math.max(0, openEventStreams - 1)
+      persistClientCount()
       log(`event stream closed (${reason}) open=${openEventStreams}`)
     }
 
@@ -766,6 +790,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         openEventStreams++
+        persistClientCount()
         log(`event stream opened open=${openEventStreams}`)
         const write = (chunk: string): boolean => {
           if (closed) return false
@@ -1121,6 +1146,8 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
       defaultSession: sessionID,
       startedAt: Date.now(),
       pid: process.pid,
+      clients: openEventStreams,
+      updatedAt: Date.now(),
     }
     const handler = makeHandler(tok, () => state)
 
