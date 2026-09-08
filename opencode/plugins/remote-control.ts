@@ -731,6 +731,9 @@ inbox.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefa
 loadSessions();
 </script></body></html>`
 
+const REMOTE_CONTROL_SYSTEM_PROMPT = `Remote control (plugin primitive)
+\`remote_control\` registers this session with the phone/browser client on the user's tailnet, so the conversation can be picked up from another device. Call it whenever the user asks about remote control or runs \`/remote-control\`, mapping their words to the action: empty or "toggle" toggles, "on" and "off" force a state, "status" reports, "pair" prints the once-per-machine pairing URL. Report every URL it returns verbatim - they carry tokens, so a paraphrase is useless. A connected phone streams this transcript live and drives the session through the same API, so nothing special is needed on your side while it is on: work exactly as you normally would.`
+
 export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   log(`plugin loaded dir=${directory} serverUrl=${serverUrl?.href ?? "-"} pid=${process.pid}`)
   async function listSessions(): Promise<SessionRow[]> {
@@ -1227,6 +1230,12 @@ ${serve.out}`
   }
 
   return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      try {
+        if (output.system.includes(REMOTE_CONTROL_SYSTEM_PROMPT)) return
+        output.system.push(REMOTE_CONTROL_SYSTEM_PROMPT)
+      } catch {}
+    },
     tool: {
       remote_control: tool({
         description: `Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet.

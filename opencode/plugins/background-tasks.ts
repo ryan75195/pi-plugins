@@ -144,6 +144,9 @@ function statusIcon(status: TaskStatus): string {
 	}
 }
 
+const BACKGROUND_TASKS_SYSTEM_PROMPT = `Background tasks (plugin primitive)
+Anything that keeps running once started - dev servers, file watchers, long builds, log tails, anything you would otherwise background with \`&\` - goes through the \`bash_background\` tool. Plain \`bash\` is for commands that finish on their own; using it for a long-lived process blocks the turn until something kills it. You never have to wait for a background task: when one exits, a completion message with its status, exit code and output tail arrives in this conversation by itself, so do not call \`task_output\` in a polling loop. Call \`task_output\` once when you genuinely need the current tail, \`task_list\` to see everything, \`task_stop\` to kill one. \`/processes\` shows the same list to the user.`
+
 export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 	const tasks = new Map<string, BgTask>()
 	// Track which sessions are busy so notifications trigger a reply when idle
@@ -488,6 +491,12 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 	}
 
 	return {
+		"experimental.chat.system.transform": async (_input, output) => {
+			try {
+				if (output.system.includes(BACKGROUND_TASKS_SYSTEM_PROMPT)) return
+				output.system.push(BACKGROUND_TASKS_SYSTEM_PROMPT)
+			} catch {}
+		},
 		dispose: async () => {
 			// Stop our running tasks and drop our entries from the shared state
 			// file so the TUI sidebar doesn't show stale rows.

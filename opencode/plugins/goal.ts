@@ -88,6 +88,9 @@ async function persist(goals: Map<string, GoalState>) {
 	}
 }
 
+const GOAL_SYSTEM_PROMPT = `Goal (plugin primitive)
+When the user states a completion condition - "keep going until the tests pass", "don't stop until the build is green", or the \`/goal\` command - your FIRST tool call is \`goal_set\` with that condition, before any other work. From then on an evaluator checks the condition after each of your turns and either clears the goal (MET) or hands back guidance and starts another turn automatically. So keep working until the evaluator reports MET: do not stop between turns to ask the user whether to carry on. \`goal_status\` reports the active condition and progress, \`goal_clear\` ends it.`
+
 export const GoalPlugin: Plugin = async ({ client, directory }) => {
 	const goals = new Map<string, GoalState>()
 	const sessionBusy = new Map<string, boolean>()
@@ -285,6 +288,12 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 	}
 
 	return {
+		"experimental.chat.system.transform": async (_input, output) => {
+			try {
+				if (output.system.includes(GOAL_SYSTEM_PROMPT)) return
+				output.system.push(GOAL_SYSTEM_PROMPT)
+			} catch {}
+		},
 		event: async ({ event }) => {
 			if (event.type === "session.status") {
 				sessionBusy.set(event.properties.sessionID, event.properties.status.type !== "idle")
