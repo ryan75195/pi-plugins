@@ -412,6 +412,23 @@ function freePort(): number {
   return BASE_PORT
 }
 
+/**
+ * Bun.serve turns a throwing handler into a logged 500 under `opencode serve`,
+ * but inside a TUI-hosted instance the escaping error has killed the process.
+ * Every server handler goes through this so a bug in one route can only ever
+ * cost that one response.
+ */
+function guarded(handler: (req: Request) => Response | Promise<Response>) {
+  return async (req: Request): Promise<Response> => {
+    try {
+      return await handler(req)
+    } catch (e) {
+      log(`handler error ${req.method} ${new URL(req.url).pathname}: ${String(e).slice(0, 200)}`)
+      return json({ error: "internal error" }, 500)
+    }
+  }
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } })
 }
@@ -568,7 +585,7 @@ async function hubHandler(req: Request): Promise<Response> {
 function tryHostHub(): boolean {
   if (hubServer) return true
   try {
-    hubServer = Bun.serve({ hostname: "127.0.0.1", port: HUB_PORT, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: hubHandler })
+    hubServer = Bun.serve({ hostname: "127.0.0.1", port: HUB_PORT, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: guarded(hubHandler) })
     return true
   } catch {
     return false // another instance already hosts it — the normal case
@@ -692,6 +709,7 @@ loadSessions();
 </script></body></html>`
 
 export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl }) => {
+  log(`plugin loaded dir=${directory} serverUrl=${serverUrl?.href ?? "-"} pid=${process.pid}`)
   async function listSessions(): Promise<SessionRow[]> {
     const result = await client.session.list({ query: { directory } })
     const rows = (result.data ?? []) as Array<Record<string, unknown>>
@@ -792,19 +810,26 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
    * status and body passed straight through like the SDK-backed routes.
    */
   async function questionProxy(path: string, body?: unknown): Promise<Response> {
-    const base = serverUrl.href.endsWith("/") ? serverUrl.href : serverUrl.href + "/"
-    const target = new URL(path, base)
-    target.searchParams.set("directory", directory)
-    const upstream = await fetch(target, {
-      method: body === undefined ? "GET" : "POST",
-      ...(body === undefined
-        ? {}
-        : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-    })
-    return new Response(await upstream.text(), {
-      status: upstream.status,
-      headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
-    })
+    // Never let this throw: inside a TUI-hosted instance an escaping handler
+    // error has taken the whole process down. Unreachable server -> 502.
+    try {
+      const base = serverUrl.href.endsWith("/") ? serverUrl.href : serverUrl.href + "/"
+      const target = new URL(path, base)
+      target.searchParams.set("directory", directory)
+      const upstream = await fetch(target, {
+        method: body === undefined ? "GET" : "POST",
+        ...(body === undefined
+          ? {}
+          : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+      })
+      return new Response(await upstream.text(), {
+        status: upstream.status,
+        headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+      })
+    } catch (e) {
+      log(`question proxy failed for ${path} via ${serverUrl?.href ?? "-"}: ${String(e).slice(0, 160)}`)
+      return json({ error: "question routes unavailable on this instance" }, 502)
+    }
   }
 
   function makeHandler(tok: string, getState: () => RemoteState | undefined) {
@@ -1054,7 +1079,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
     }
     const handler = makeHandler(tok, () => state)
 
-    server = Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: handler })
+    server = Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: guarded(handler) })
 
     log(`start id=${id} port=${port} mount=${mount} dir=${directory}`)
     const serve = tailscale(["serve", "--bg", "--set-path", mount, String(port)])
