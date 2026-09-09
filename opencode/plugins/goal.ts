@@ -351,6 +351,9 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 			loopTimers.delete(sessionID)
 			void runLoopIteration(sessionID)
 		}, loop.intervalMs ?? LOOP_DEFAULT_INTERVAL_MS)
+		// A cadence timer must never hold the host process open: opencode stays
+		// alive on its own, and a leaked handle here hangs test runners.
+		timer.unref?.()
 		loopTimers.set(sessionID, timer)
 	}
 
