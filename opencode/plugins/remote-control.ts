@@ -171,8 +171,9 @@ let activeState: RemoteState | undefined // this process's registration (in-memo
 let eventLog: Array<{ type: string; sessionID?: string }> = []
 const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>()
 type NativeStreamSink = { write: (chunk: string) => boolean }
-// Phone / native clients on GET /event, fed by the plugin event hook.
-const nativeStreamSinks = new Set<NativeStreamSink>()
+// Phone / native clients on GET /event, keyed by instance directory and fed by
+// the plugin event hook (forwardInstanceEvent).
+const nativeStreamSinks = new Map<string, Set<NativeStreamSink>>()
 // Live /event subscribers, counted so a leaked subscription shows up in the log
 // rather than only as quietly growing memory.
 let openEventStreams = 0
@@ -500,15 +501,340 @@ export type InstanceRouteDeps = {
 }
 
 export function makeInstanceRouteHandler(deps: InstanceRouteDeps): (req: Request) => Promise<Response> {
-  throw new Error("NotImplementedException: makeInstanceRouteHandler")
+  const { client, directory, token: tok, getState, listSessions, messagesOf, questionProxy } = deps
+
+  const sdk = async (
+    run: () => Promise<{ data?: unknown; error?: unknown; response?: { status?: number } }>,
+  ): Promise<Response> => {
+    const res = await run()
+    if (res.error !== undefined && res.error !== null) return json(res.error, res.response?.status ?? 500)
+    return json(res.data)
+  }
+
+  return async (req: Request): Promise<Response> => {
+    const url = new URL(req.url)
+    const seg = url.pathname.replace(/\/+$/, "") || "/"
+    if (seg === "/" || seg === "") {
+      if (!authorizedInstance(req, tok)) return new Response("unauthorized", { status: 401 })
+      return new Response(CLIENT_HTML, { headers: { "content-type": "text/html; charset=utf-8" } })
+    }
+    if (!authorizedInstance(req, tok)) return json({ error: "unauthorized" }, 401)
+
+    // Native opencode REST surface so native clients (opencode-ios, any REST
+    // app) can manage this TUI's sessions through the tunnel. Auth: Basic
+    // opencode:<token> or ?t=/x-oc-token.
+    const parts = seg.split("/").filter(Boolean)
+    if (
+      parts[0] === "session" ||
+      parts[0] === "question" ||
+      seg === "/event" ||
+      seg === "/config/providers" ||
+      seg === "/agent" ||
+      seg === "/command"
+    ) {
+      try {
+        if (seg === "/event" && req.method === "GET") return openInstanceEventStream(directory)
+        // The model and agent catalogues, so a remote client can render a
+        // picker instead of guessing at the instance defaults. Both are
+        // returned exactly as the SDK gives them — each provider carries its
+        // own `models` map alongside a `default` map — because reshaping
+        // here would only date the client.
+        if (seg === "/config/providers" && req.method === "GET") {
+          return sdk(() => client.config.providers({ query: { directory } }))
+        }
+        if (seg === "/agent" && req.method === "GET") {
+          return sdk(() => client.app.agents({ query: { directory } }))
+        }
+        // The catalogue behind POST /session/:id/command. Without it a remote
+        // client has to know a command's name up front, so it cannot offer a
+        // command menu at all. Returned untouched like the other catalogues:
+        // every entry carries its own `template`, `source` and optional
+        // agent/model overrides, and reshaping here would only date the client.
+        if (seg === "/command" && req.method === "GET") {
+          return sdk(() => client.command.list({ query: { directory } }))
+        }
+        // The question tool. The assistant blocks until a request is answered
+        // or rejected, so a remote client needs all three routes or a question
+        // asked over the tunnel strands the session with no way out. The
+        // matching `question.asked` / `question.replied` / `question.rejected`
+        // events already reach clients on /event, which forwards every event
+        // type untouched.
+        if (parts[0] === "question") {
+          if (parts.length === 1 && req.method === "GET") return questionProxy("question")
+          const requestID = parts[1]
+          if (requestID && parts.length === 3 && req.method === "POST") {
+            const target = "question/" + encodeURIComponent(requestID) + "/" + parts[2]
+            if (parts[2] === "reject") return questionProxy(target, {})
+            if (parts[2] === "reply") {
+              const body = (await req.json().catch(() => ({}))) as { answers?: unknown }
+              const answers = pickAnswers(body.answers)
+              if (!answers) return json({ error: "answers must be an array of string arrays" }, 400)
+              return questionProxy(target, { answers })
+            }
+          }
+          return json({ error: "not found" }, 404)
+        }
+        if (parts[0] !== "session") return json({ error: "not found" }, 404)
+        if (parts.length === 1) {
+          if (req.method === "GET") return sdk(() => client.session.list({ query: { directory } }))
+          if (req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { title?: string }
+            return sdk(() => client.session.create({ body: { title: body.title }, query: { directory } }))
+          }
+        }
+        if (parts.length === 2 && parts[1] === "status" && req.method === "GET") {
+          return sdk(() => client.session.status({ query: { directory } }))
+        }
+        // Rename. The SDK's session.update takes a partial session, but the
+        // only field worth exposing to a remote client is the title, and a
+        // blank one is rejected here rather than quietly clearing it.
+        if (parts.length === 2 && req.method === "PATCH") {
+          const id = parts[1]
+          const body = (await req.json().catch(() => ({}))) as { title?: unknown }
+          const title = typeof body.title === "string" ? body.title.trim() : ""
+          if (title.length === 0) return json({ error: "title required" }, 400)
+          return sdk(() => client.session.update({ path: { id }, body: { title }, query: { directory } }))
+        }
+        // Delete. Like the other per-id routes it proxies through the SDK and
+        // re-emits an upstream error (an unknown id included) with its own
+        // status and body instead of succeeding silently. Deletion is
+        // permanent — the confirmation guard lives in the client, not here.
+        if (parts.length === 2 && req.method === "DELETE") {
+          const id = parts[1]
+          return sdk(() => client.session.delete({ path: { id }, query: { directory } }))
+        }
+        if (parts.length >= 3) {
+          const id = parts[1]
+          if (parts[2] === "message" && req.method === "GET") {
+            const limit = Number(url.searchParams.get("limit"))
+            return sdk(() =>
+              client.session.messages({
+                path: { id },
+                query: { ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}), directory },
+              }),
+            )
+          }
+          if (parts[2] === "prompt_async" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as {
+              parts?: unknown
+              model?: unknown
+              agent?: unknown
+            }
+            const promptParts = pickPromptParts(body.parts)
+            const model = pickModel(body.model)
+            const agent = pickAgent(body.agent)
+            return sdk(() =>
+              client.session.promptAsync({
+                path: { id },
+                body: { parts: promptParts, ...(model ? { model } : {}), ...(agent ? { agent } : {}) },
+                query: { directory },
+              }),
+            )
+          }
+          if (parts[2] === "abort" && req.method === "POST") {
+            return sdk(() => client.session.abort({ path: { id }, query: { directory } }))
+          }
+          if (parts[2] === "command" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as {
+              command?: string
+              arguments?: string
+              messageID?: string
+              model?: unknown
+              agent?: unknown
+            }
+            const model = pickCommandModel(body.model)
+            const agent = pickAgent(body.agent)
+            return sdk(() =>
+              client.session.command({
+                path: { id },
+                body: {
+                  command: body.command ?? "",
+                  arguments: body.arguments ?? "",
+                  ...(body.messageID ? { messageID: body.messageID } : {}),
+                  ...(model ? { model } : {}),
+                  ...(agent ? { agent } : {}),
+                },
+                query: { directory },
+              }),
+            )
+          }
+          if (parts[2] === "permissions" && parts[3] && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { response?: string }
+            return sdk(() =>
+              client.postSessionIdPermissionsPermissionId({
+                path: { id, permissionID: parts[3] },
+                body: { response: body.response as never },
+                query: { directory },
+              }),
+            )
+          }
+        }
+      } catch (e) {
+        return json({ error: String(e) }, 502)
+      }
+    }
+
+    if (url.pathname === "/api/status") return json({ ok: true, ...getState() })
+
+    if (url.pathname === "/api/sessions") return json(await listSessions())
+
+    if (url.pathname === "/api/messages") {
+      const sid = url.searchParams.get("session")
+      if (!sid) return json({ error: "session required" }, 400)
+      try {
+        return json(await messagesOf(sid))
+      } catch (e) {
+        return json({ error: String(e) }, 502)
+      }
+    }
+
+    if (url.pathname === "/api/send" && req.method === "POST") {
+      const body = (await req.json()) as { session?: string; text?: string }
+      if (!body.session || !body.text?.trim()) return json({ error: "session and text required" }, 400)
+      await client.session.promptAsync({
+        path: { id: body.session },
+        body: { parts: [{ type: "text", text: body.text.trim() }] },
+        query: { directory },
+      })
+      return json({ ok: true, queued: true })
+    }
+
+    if (url.pathname === "/api/new" && req.method === "POST") {
+      const res = await client.session.create({ body: { title: "remote" }, query: { directory } })
+      return json({ id: res.data?.id })
+    }
+
+    if (url.pathname === "/api/events") {
+      const sid = url.searchParams.get("session") ?? undefined
+      let closed = false
+      let keepalive: ReturnType<typeof setInterval> | undefined
+      const enc = new TextEncoder()
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const write = (chunk: string) => {
+            if (closed) return
+            controller.enqueue(enc.encode(chunk))
+          }
+          sseClients.add({ session: sid, write })
+          write("retry: 3000\n\n")
+          keepalive = setInterval(() => {
+            if (closed) {
+              if (keepalive) clearInterval(keepalive)
+              return
+            }
+            write(": ping\n\n")
+          }, SSE_KEEPALIVE_MS)
+        },
+        cancel() {
+          closed = true
+          if (keepalive) clearInterval(keepalive)
+        },
+      })
+      return new Response(stream, {
+        headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+      })
+    }
+
+    return json({ error: "not found" }, 404)
+  }
 }
 
+/**
+ * Live SDK event feed, in the shape native clients already speak: opencode's
+ * own /global/event wraps every event as { directory, payload } and the app
+ * reads `payload`. Emitting the bare SDK event here left `payload` undefined,
+ * so the app threw on every frame and reconnected forever — nothing streamed.
+ * Every event type is forwarded untouched; filtering belongs to the client.
+ */
 export function openInstanceEventStream(directory: string): Response {
-  throw new Error("NotImplementedException: openInstanceEventStream")
+  const encoder = new TextEncoder()
+  let closed = false
+  let keepalive: ReturnType<typeof setInterval> | undefined
+  let sink: NativeStreamSink | undefined
+
+  const release = (reason: string) => {
+    if (closed) return
+    closed = true
+    if (keepalive) clearInterval(keepalive)
+    keepalive = undefined
+    if (sink) nativeStreamSinks.get(directory)?.delete(sink)
+    openEventStreams = Math.max(0, openEventStreams - 1)
+    persistClientCount()
+    log(`event stream closed (${reason}) open=${openEventStreams}`)
+  }
+
+  // Events come from the plugin's own `event` hook (forwardInstanceEvent), NOT
+  // from client.event.subscribe(): inside a TUI-hosted instance that SDK
+  // subscription never yields, while the hook fires in every mode.
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      openEventStreams++
+      persistClientCount()
+      log(`event stream opened open=${openEventStreams}`)
+      const write = (chunk: string): boolean => {
+        if (closed) return false
+        try {
+          controller.enqueue(encoder.encode(chunk))
+          return true
+        } catch {
+          release("write failed")
+          try {
+            controller.close()
+          } catch {
+            /* already closed */
+          }
+          return false
+        }
+      }
+      sink = { write }
+      let sinks = nativeStreamSinks.get(directory)
+      if (!sinks) {
+        sinks = new Set()
+        nativeStreamSinks.set(directory, sinks)
+      }
+      sinks.add(sink)
+      write("retry: 3000\n\n")
+      write(`data: ${JSON.stringify({ directory, payload: { type: "server.connected", properties: {} } })}\n\n`)
+      // tailscale serve (and any proxy in between) drops a stream that goes
+      // quiet. A comment frame keeps it warm and every SSE parser ignores it.
+      keepalive = setInterval(() => write(": ping\n\n"), SSE_KEEPALIVE_MS)
+    },
+    cancel() {
+      release("client disconnected")
+    },
+  })
+
+  return new Response(stream, {
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+  })
 }
 
 export function forwardInstanceEvent(directory: string, event: RemoteControlEvent): void {
-  throw new Error("NotImplementedException: forwardInstanceEvent")
+  // Live /event subscribers get the event untouched inside the { directory,
+  // payload } wrapper native clients already parse; filtering is the client's
+  // job. Sinks are per directory, so one process never cross-posts another
+  // instance's feed.
+  const sinks = nativeStreamSinks.get(directory)
+  if (sinks && sinks.size > 0) {
+    const frame = `data: ${JSON.stringify({ directory, payload: event })}\n\n`
+    for (const sink of sinks) {
+      if (!sink.write(frame)) sinks.delete(sink)
+    }
+  }
+  if (!event.type.startsWith("message") && !event.type.startsWith("session")) return
+  const sid = (event.properties as { sessionID?: string } | undefined)?.sessionID
+  eventLog.push({ type: event.type, sessionID: sid })
+  if (eventLog.length > MAX_EVENTS) eventLog = eventLog.slice(-MAX_EVENTS)
+  const line = `data: ${JSON.stringify({ type: event.type, sessionID: sid })}\n\n`
+  for (const c of sseClients) {
+    if (!c.session || !sid || c.session === sid) {
+      try {
+        c.write(line)
+      } catch {
+        sseClients.delete(c)
+      }
+    }
+  }
 }
 
 // ── Hub ─────────────────────────────────────────────────────────────────────
