@@ -32,6 +32,7 @@ export async function openTestInstance(
     sessions?: Array<{ id: string; title: string }>
     messages?: Record<string, FakeMessageRow[]>
   } = {},
+  options: { disconnect?: () => void } = {},
 ): Promise<TestInstance> {
   const mod = await loadModule()
   const directory = `/work/contract-${Math.random().toString(36).slice(2, 8)}`
@@ -60,10 +61,11 @@ export async function openTestInstance(
     messagesOf: async () => {
       throw new Error("the web-page /api/* surface is outside this contract")
     },
-    questionProxy: async () => {
-      throw new Error("question routes are outside this contract")
-    },
-  })
+      questionProxy: async () => {
+        throw new Error("question routes are outside this contract")
+      },
+      disconnect: options.disconnect ?? (() => {}),
+    })
   const request = async (method: string, path: string, options: CallOptions = {}): Promise<Response> => {
     const headers: Record<string, string> = {}
     if (options.token !== null) headers["x-oc-token"] = options.token ?? token
