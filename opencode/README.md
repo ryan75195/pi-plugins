@@ -59,7 +59,7 @@ as first-class capabilities rather than as documentation it might have read:
 |---|---|
 | [plugins/background-tasks.ts](plugins/background-tasks.ts) | `Background tasks (plugin primitive)` — anything that keeps running goes through `bash_background`; completion arrives as a message, don't poll. |
 | [plugins/monitor.ts](plugins/monitor.ts) | `Monitor (plugin primitive)` — never sleep or poll in a loop; start a filtered `monitor` watch and act on `[monitor …]` events. |
-| [plugins/goal.ts](plugins/goal.ts) | `Goal (plugin primitive)` — a stated completion condition makes `goal_set` the first tool call; work until the evaluator says MET. |
+| [plugins/goal.ts](plugins/goal.ts) | `Goal (plugin primitive)` + `Loop (plugin primitive)` — a stated completion condition makes `goal_set` the first tool call; work until the evaluator says MET. A recurring task makes `loop` the first tool call; it re-runs its prompt on a cadence until `until` holds or the cap is reached, and `loop_stop` ends it. |
 | [plugins/remote-control.ts](plugins/remote-control.ts) | `Remote control (plugin primitive)` — what `remote_control` does, its actions, and reporting URLs verbatim. |
 
 Each push is guarded (skipped if the same section is already in `output.system`)
@@ -379,5 +379,6 @@ of the tools in `opencode/plugins/`, which the model sees on every turn:
 | `/monitor` | `monitor`, `monitor_stop` in [plugins/monitor.ts](plugins/monitor.ts) |
 | `/processes` | `task_list`, `task_stop`, `task_output` in [plugins/background-tasks.ts](plugins/background-tasks.ts) |
 | `/goal` | `goal_set`, `goal_status`, `goal_clear` in [plugins/goal.ts](plugins/goal.ts) |
+| `/loop` | `loop`, `loop_stop` in [plugins/goal.ts](plugins/goal.ts) |
 
 Change a command's behaviour in the tool description, not the template.

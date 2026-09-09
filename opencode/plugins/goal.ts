@@ -43,6 +43,9 @@ const MAX_TRANSCRIPT_CHARS = 10_000
 const MAX_NO_TOOL_STREAK = 3
 const MAX_IDLE_DEFERRALS = 3
 const MAX_TURNS = 40 // hard cap: a goal that never resolves stops after this many evaluated turns
+const LOOP_DEFAULT_INTERVAL_MS = 5 * 60_000 // self-paced default: re-run five minutes after each turn
+const LOOP_MIN_INTERVAL_MS = 60_000 // token-safety floor for fixed cadences (no sub-minute loops)
+const LOOP_MAX_ITERATIONS = 40 // default cap: a loop that never stops ends after this many runs
 
 type GoalStatus = "active" | "achieved" | "failed" | "paused"
 
@@ -55,6 +58,22 @@ interface GoalState {
 	noToolStreak: number
 	idleDeferrals: number
 	endedAt?: number
+}
+
+type LoopStatus = "active" | "finished" | "stopped" | "failed"
+
+interface LoopState {
+	prompt: string
+	until?: string
+	/** Fixed cadence in ms; undefined = self-paced (re-run five minutes after each turn). */
+	intervalMs?: number
+	/** Iterations dispatched so far (the first run at start counts). */
+	iterations: number
+	maxIterations: number
+	status: LoopStatus
+	startedAt: number
+	endedAt?: number
+	lastReason?: string
 }
 
 const VERDICT_SYSTEM =
@@ -93,14 +112,21 @@ async function persist(goals: Map<string, GoalState>) {
 }
 
 const GOAL_SYSTEM_PROMPT = `Goal (plugin primitive)
-When the user states a completion condition - "keep going until the tests pass", "don't stop until the build is green", or the \`/goal\` command - your FIRST tool call is \`goal_set\` with that condition, before any other work. From then on an evaluator checks the condition after each of your turns and either clears the goal (MET) or hands back guidance and starts another turn automatically. So keep working until the evaluator reports MET: do not stop between turns to ask the user whether to carry on. \`goal_status\` reports the active condition and progress, \`goal_clear\` ends it.`
+When the user states a completion condition - "keep going until the tests pass", "don't stop until the build is green", or the \`/goal\` command - your FIRST tool call is \`goal_set\` with that condition, before any other work. From then on an evaluator checks the condition after each of your turns and either clears the goal (MET) or hands back guidance and starts another turn automatically. So keep working until the evaluator reports MET: do not stop between turns to ask the user whether to carry on. \`goal_status\` reports the active condition and progress, \`goal_clear\` ends it.
+
+Loop (plugin primitive)
+When the user wants a prompt re-run on a schedule or over and over - "check the deploy every 5 minutes", "keep running this until it passes", or the \`/loop\` command - your FIRST tool call is \`loop\` with the user's words as \`prompt\` (plus \`every\` for a fixed cadence, \`until\` for the stop condition, \`max_iterations\` for the cap), before any other work. Each iteration is dispatched into the session automatically; keep answering the re-run prompt without asking the user between iterations. \`loop_stop\` ends the active loop early; otherwise the loop ends when the \`until\` condition holds or the iteration cap is reached.`
 
 export const GoalPlugin: Plugin = async ({ client, directory }) => {
 	const goals = new Map<string, GoalState>()
+	const loops = new Map<string, LoopState>()
+	// One pending cadence timer per session with an active loop; dispose() clears them all.
+	const loopTimers = new Map<string, ReturnType<typeof setTimeout>>()
 	const sessionBusy = new Map<string, boolean>()
 	// Last model seen per session, used if small_model isn't configured.
 	const sessionModel = new Map<string, { providerID: string; modelID: string }>()
 	const evaluating = new Set<string>()
+	const loopEvaluating = new Set<string>()
 
 	async function sessionModelFor(sessionID: string): Promise<{ providerID: string; modelID: string } | undefined> {
 		// Prefer the configured small model (cheap, fast — like Claude Code's Haiku).
@@ -148,95 +174,105 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 		return { verdict: m[1] as "MET" | "NOT_MET" | "IMPOSSIBLE", reason: m[2].trim().slice(0, 400) }
 	}
 
+	function replyText(data: unknown): string {
+		const d = data as { parts?: Array<{ type: string; text?: string }> } | undefined
+		return (d?.parts ?? []).filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n")
+	}
+
+	/**
+	 * Ask the evaluator (throwaway child session, no tools, small model) to
+	 * judge a condition against the session transcript. Shared by the goal
+	 * and loop paths. Returns the parsed verdict, or undefined when the model
+	 * gave no verdict (after one retry).
+	 */
+	async function askEvaluator(
+		sessionID: string,
+		prompt: string,
+		title: string,
+	): Promise<{ verdict: { verdict: "MET" | "NOT_MET" | "IMPOSSIBLE"; reason: string } | undefined; reply: string }> {
+		const model = await sessionModelFor(sessionID)
+		const body = {
+			...(model ? { model } : {}),
+			system: VERDICT_SYSTEM,
+			tools: {},
+			parts: [{ type: "text" as const, text: prompt }],
+		}
+		// Throwaway child session: isolated context, no tools, small model.
+		const child = await client.session.create({ body: { title }, query: { directory } })
+		const childID = child.data?.id
+		if (!childID) throw new Error("could not create evaluator session")
+		try {
+			const result = await client.session.prompt({ path: { id: childID }, body, query: { directory } })
+			const reply = replyText(result.data)
+			let verdict = parseVerdict(reply)
+			// Free/small models sometimes return empty; retry once.
+			if (!verdict) {
+				await new Promise((r) => setTimeout(r, 800))
+				const retry = await client.session.prompt({
+					path: { id: childID },
+					body: {
+						...body,
+						parts: [{ type: "text", text: "Reply now with exactly one line: MET: <reason>, NOT_MET: <what is missing>, or IMPOSSIBLE: <why>." }],
+					},
+					query: { directory },
+				})
+				verdict = parseVerdict(replyText(retry.data))
+			}
+			return { verdict, reply }
+		} finally {
+			await client.session.delete({ path: { id: childID }, query: { directory } }).catch(() => {})
+		}
+	}
+
 	async function evaluate(sessionID: string) {
 		const goal = goals.get(sessionID)
 		if (!goal || goal.status !== "active" || evaluating.has(sessionID)) return
 		evaluating.add(sessionID)
 		try {
-			const model = await sessionModelFor(sessionID)
 			const prompt =
 				`Completion condition: ${goal.condition}\n\n` +
 				`Recent conversation:\n${await transcript(sessionID)}\n\n` +
 				`Has the condition been satisfied? Reply with exactly one line: MET: <reason>, NOT_MET: <what is missing>, or IMPOSSIBLE: <why it can never be met>.`
+			const { verdict, reply } = await askEvaluator(sessionID, prompt, "goal-eval")
 
-			// Throwaway child session: isolated context, no tools, small model.
-			const child = await client.session.create({ body: { title: "goal-eval" }, query: { directory } })
-			const childID = child.data?.id
-			if (!childID) throw new Error("could not create evaluator session")
-			try {
-				const result = await client.session.prompt({
-					path: { id: childID },
-					body: {
-						...(model ? { model } : {}),
-						system: VERDICT_SYSTEM,
-						tools: {},
-						parts: [{ type: "text", text: prompt }],
-					},
-					query: { directory },
-				})
-				const data = result.data as unknown as { parts?: Array<{ type: string; text?: string }> } | undefined
-				let reply = ""
-				if (data?.parts) reply = data.parts.filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n")
-				let verdict = parseVerdict(reply)
-				// Free/small models sometimes return empty; retry once.
-				if (!verdict) {
-					await new Promise((r) => setTimeout(r, 800))
-					const retry = await client.session.prompt({
-						path: { id: childID },
-						body: {
-							...(model ? { model } : {}),
-							system: VERDICT_SYSTEM,
-							tools: {},
-							parts: [{ type: "text", text: "Reply now with exactly one line: MET: <reason>, NOT_MET: <what is missing>, or IMPOSSIBLE: <why>." }],
-						},
-						query: { directory },
-					})
-					const retryData = retry.data as unknown as { parts?: Array<{ type: string; text?: string }> } | undefined
-					const retryReply = (retryData?.parts ?? []).filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n")
-					verdict = parseVerdict(retryReply)
-				}
+			if (!verdict) {
+				goal.lastReason = `evaluator gave no verdict; continuing (${reply.slice(0, 120)})`
+			} else if (verdict.verdict === "MET") {
+				goal.status = "achieved"
+				goal.lastReason = verdict.reason
+				goal.endedAt = Date.now()
+				await deliver(sessionID, `◎ Goal achieved in ${goal.turns} turns: ${goal.condition}\nEvaluator: ${verdict.reason}`)
+			} else if (verdict.verdict === "IMPOSSIBLE") {
+				goal.status = "failed"
+				goal.lastReason = verdict.reason
+				goal.endedAt = Date.now()
+				await deliver(sessionID, `◎ Goal marked impossible by the evaluator — cleared.\nCondition: ${goal.condition}\nReason: ${verdict.reason}`)
+			} else {
+				goal.turns += 1
+				goal.lastReason = verdict.reason
+				// Anti-stall: if the last assistant turn used no tools, count it.
+				if (await lastTurnHadNoTools(sessionID)) goal.noToolStreak += 1
+				else goal.noToolStreak = 0
 
-				if (!verdict) {
-					goal.lastReason = `evaluator gave no verdict; continuing (${reply.slice(0, 120)})`
-				} else if (verdict.verdict === "MET") {
-					goal.status = "achieved"
-					goal.lastReason = verdict.reason
-					goal.endedAt = Date.now()
-					await deliver(sessionID, `◎ Goal achieved in ${goal.turns} turns: ${goal.condition}\nEvaluator: ${verdict.reason}`)
-				} else if (verdict.verdict === "IMPOSSIBLE") {
+				if (goal.turns >= MAX_TURNS) {
 					goal.status = "failed"
-					goal.lastReason = verdict.reason
 					goal.endedAt = Date.now()
-					await deliver(sessionID, `◎ Goal marked impossible by the evaluator — cleared.\nCondition: ${goal.condition}\nReason: ${verdict.reason}`)
+					await deliver(
+						sessionID,
+						`◎ Goal stopped after ${MAX_TURNS} turns without the condition being met — cleared to avoid burning tokens.\nCondition: ${goal.condition}\nLast evaluation: ${verdict.reason}\nSet a narrower goal or continue manually.`,
+					)
+				} else if (goal.noToolStreak >= MAX_NO_TOOL_STREAK) {
+					goal.status = "paused"
+					await deliver(
+						sessionID,
+						`◎ Goal paused: ${MAX_NO_TOOL_STREAK} turns without tool use, so the loop stopped to avoid spinning.\nCondition: ${goal.condition}\nLast evaluation: ${verdict.reason}\nKeep prompting to resume the loop.`,
+					)
 				} else {
-					goal.turns += 1
-					goal.lastReason = verdict.reason
-					// Anti-stall: if the last assistant turn used no tools, count it.
-					if (await lastTurnHadNoTools(sessionID)) goal.noToolStreak += 1
-					else goal.noToolStreak = 0
-
-					if (goal.turns >= MAX_TURNS) {
-						goal.status = "failed"
-						goal.endedAt = Date.now()
-						await deliver(
-							sessionID,
-							`◎ Goal stopped after ${MAX_TURNS} turns without the condition being met — cleared to avoid burning tokens.\nCondition: ${goal.condition}\nLast evaluation: ${verdict.reason}\nSet a narrower goal or continue manually.`,
-						)
-					} else if (goal.noToolStreak >= MAX_NO_TOOL_STREAK) {
-						goal.status = "paused"
-						await deliver(
-							sessionID,
-							`◎ Goal paused: ${MAX_NO_TOOL_STREAK} turns without tool use, so the loop stopped to avoid spinning.\nCondition: ${goal.condition}\nLast evaluation: ${verdict.reason}\nKeep prompting to resume the loop.`,
-						)
-					} else {
-						await deliver(
-							sessionID,
-							`◎ Goal evaluation: NOT YET MET (turn ${goal.turns}).\nEvaluator guidance: ${verdict.reason}\nContinue working toward the goal. Condition: ${goal.condition}`,
-						)
-					}
+					await deliver(
+						sessionID,
+						`◎ Goal evaluation: NOT YET MET (turn ${goal.turns}).\nEvaluator guidance: ${verdict.reason}\nContinue working toward the goal. Condition: ${goal.condition}`,
+					)
 				}
-			} finally {
-				await client.session.delete({ path: { id: childID }, query: { directory } }).catch(() => {})
 			}
 		} catch (err) {
 			// Transient evaluator failures keep the goal active (like Claude Code).
@@ -291,6 +327,131 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 		}
 	}
 
+	// ---------------------------------------------------------------------------
+	// Loop machinery (the /loop primitive): a prompt re-run on a fixed cadence or
+	// self-paced, with an optional until stop condition judged by the same
+	// evaluator the goal uses, and an iteration cap. Terminal states end
+	// silently — a finished, stopped, or failed loop never starts another turn.
+	// ---------------------------------------------------------------------------
+
+	function clearLoopTimer(sessionID: string) {
+		const timer = loopTimers.get(sessionID)
+		if (timer) {
+			clearTimeout(timer)
+			loopTimers.delete(sessionID)
+		}
+	}
+
+	/** Arm the next cadence run for an active loop (fixed interval or the self-paced default). */
+	function scheduleNextRun(sessionID: string) {
+		const loop = loops.get(sessionID)
+		if (!loop || loop.status !== "active" || loop.iterations >= loop.maxIterations) return
+		clearLoopTimer(sessionID)
+		const timer = setTimeout(() => {
+			loopTimers.delete(sessionID)
+			void runLoopIteration(sessionID)
+		}, loop.intervalMs ?? LOOP_DEFAULT_INTERVAL_MS)
+		loopTimers.set(sessionID, timer)
+	}
+
+	/** Push an iteration's prompt into the session. Returns false when the session is gone. */
+	async function dispatchPrompt(sessionID: string, text: string): Promise<boolean> {
+		try {
+			await client.session.promptAsync({
+				path: { id: sessionID },
+				body: { parts: [{ type: "text", text }] },
+				query: { directory },
+			})
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	/** Terminalize a loop: clear its timer, mark it ended, and announce at most once. */
+	async function endLoop(sessionID: string, loop: LoopState, status: "finished" | "stopped" | "failed", notice?: string) {
+		loop.status = status
+		loop.endedAt = Date.now()
+		clearLoopTimer(sessionID)
+		if (notice) await deliver(sessionID, notice)
+	}
+
+	function loopCapNotice(loop: LoopState): string {
+		return `◎ Loop finished: ${loop.maxIterations} iterations — stopped to avoid burning tokens.\nPrompt: ${loop.prompt}\nStart a new loop or continue manually.`
+	}
+
+	async function runLoopIteration(sessionID: string) {
+		const loop = loops.get(sessionID)
+		if (!loop || loop.status !== "active") return
+		if (sessionBusy.get(sessionID)) {
+			// A turn is in flight: don't interrupt it and don't spend an
+			// iteration. Fixed cadences retry next interval; self-paced loops
+			// reschedule when the turn goes idle.
+			if (loop.intervalMs !== undefined) scheduleNextRun(sessionID)
+			return
+		}
+		if (loop.iterations >= loop.maxIterations) {
+			// Safety net: the cap was reached between arming and firing.
+			await endLoop(sessionID, loop, "finished")
+			return
+		}
+		loop.iterations += 1
+		const dispatched = await dispatchPrompt(sessionID, loop.prompt)
+		if (!dispatched) {
+			// Session gone: end the loop silently.
+			await endLoop(sessionID, loop, "stopped")
+			return
+		}
+		if (loop.iterations >= loop.maxIterations) {
+			await endLoop(sessionID, loop, "finished", loopCapNotice(loop))
+			return
+		}
+		// Fixed cadences re-arm themselves; self-paced loops wait for the
+		// turn's session.idle to schedule the next run.
+		if (loop.intervalMs !== undefined) scheduleNextRun(sessionID)
+	}
+
+	/** Judge a loop's until stop condition on the same evaluator the goal uses. */
+	async function evaluateLoopUntil(sessionID: string) {
+		const loop = loops.get(sessionID)
+		if (!loop || loop.status !== "active" || !loop.until || loopEvaluating.has(sessionID)) return
+		loopEvaluating.add(sessionID)
+		try {
+			const prompt =
+				`Stop condition: ${loop.until}\n\n` +
+				`Recent conversation:\n${await transcript(sessionID)}\n\n` +
+				`Has the stop condition been satisfied? Reply with exactly one line: MET: <reason>, NOT_MET: <what is missing>, or IMPOSSIBLE: <why it can never be met>.`
+			const { verdict } = await askEvaluator(sessionID, prompt, "loop-eval")
+			if (!verdict) {
+				loop.lastReason = "evaluator gave no verdict; continuing"
+				return
+			}
+			loop.lastReason = verdict.reason
+			if (verdict.verdict === "MET") {
+				await endLoop(
+					sessionID,
+					loop,
+					"finished",
+					`◎ Loop finished: the stop condition holds.\nStop condition: ${loop.until}\nEvaluator: ${verdict.reason}`,
+				)
+			} else if (verdict.verdict === "IMPOSSIBLE") {
+				await endLoop(
+					sessionID,
+					loop,
+					"failed",
+					`◎ Loop stopped: the stop condition can never be met.\nStop condition: ${loop.until}\nReason: ${verdict.reason}`,
+				)
+			}
+			// NOT_MET: keep looping. Fixed cadences stay armed; self-paced loops
+			// reschedule on the turn's session.idle.
+		} catch (err) {
+			// Transient evaluator failures keep the loop running.
+			loop.lastReason = `evaluation error: ${String(err).slice(0, 200)}`
+		} finally {
+			loopEvaluating.delete(sessionID)
+		}
+	}
+
 	return {
 		"experimental.chat.system.transform": async (_input, output) => {
 			try {
@@ -307,16 +468,28 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 				const sessionID = event.properties.sessionID
 				sessionBusy.set(sessionID, false)
 				const goal = goals.get(sessionID)
-				if (!goal || goal.status !== "active" || evaluating.has(sessionID)) return
-				// Background work in flight: defer the evaluation (the task
-				// completion notification will trigger the next turn anyway).
-				if (await backgroundWorkRunning(sessionID)) {
-					goal.idleDeferrals += 1
-					if (goal.idleDeferrals <= MAX_IDLE_DEFERRALS) return
-					// Too many deferrals: evaluate anyway against what's visible.
+				if (goal && goal.status === "active" && !evaluating.has(sessionID)) {
+					// Background work in flight: defer the evaluation (the task
+					// completion notification will trigger the next turn anyway).
+					if (await backgroundWorkRunning(sessionID)) {
+						goal.idleDeferrals += 1
+						if (goal.idleDeferrals <= MAX_IDLE_DEFERRALS) {
+							// Deferred — the loop handling below still runs.
+						} else {
+							// Too many deferrals: evaluate anyway against what's visible.
+							goal.idleDeferrals = 0
+							void evaluate(sessionID)
+						}
+					} else {
+						goal.idleDeferrals = 0
+						void evaluate(sessionID)
+					}
 				}
-				goal.idleDeferrals = 0
-				void evaluate(sessionID)
+				const loop = loops.get(sessionID)
+				if (loop && loop.status === "active") {
+					if (loop.until && !loopEvaluating.has(sessionID)) void evaluateLoopUntil(sessionID)
+					if (!loop.intervalMs) scheduleNextRun(sessionID)
+				}
 				return
 			}
 			if (event.type === "message.updated") {
@@ -328,16 +501,21 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 			}
 			if (event.type === "session.error") {
 				const props = event.properties as unknown as { sessionID?: string; error?: { name?: string } }
-				const goal = props.sessionID ? goals.get(props.sessionID) : undefined
-				if (!goal || goal.status !== "active") return
-				// Unrecoverable classes clear the goal (like Claude Code): auth,
-				// credits/balance, model availability. Transient errors don't.
+				// Unrecoverable classes clear the goal/loop (like Claude Code):
+				// auth, credits/balance, model availability. Transient errors don't.
 				const name = (props.error?.name ?? "").toLowerCase()
-				if (name.includes("auth") || name.includes("credential") || name.includes("balance") || name.includes("usage") || name.includes("model")) {
+				const goal = props.sessionID ? goals.get(props.sessionID) : undefined
+				if (goal && goal.status === "active" && isUnrecoverableErrorName(name)) {
 					goal.status = "failed"
 					goal.lastReason = `unrecoverable error: ${name}`
 					goal.endedAt = Date.now()
 					void persist(goals)
+				}
+				if (props.sessionID) {
+					const loop = loops.get(props.sessionID)
+					if (loop && loop.status === "active" && isUnrecoverableErrorName(name)) {
+						void endLoop(props.sessionID, loop, "failed")
+					}
 				}
 			}
 		},
@@ -421,8 +599,62 @@ This tool backs the /loop command whenever its arguments are anything other than
 					until: tool.schema.string().optional().describe("Optional stop condition, judged by the same evaluator as /goal; the loop stops once it holds."),
 					max_iterations: tool.schema.number().optional().describe("Stop after this many iterations (default 40)."),
 				},
-				async execute(_args, _context) {
-					throw new Error("NotImplemented: loop")
+				async execute(args, context) {
+					if (!args.prompt.trim()) throw new Error("Prompt must not be empty")
+					const sessionID = context.sessionID
+					let intervalMs: number | undefined
+					let clamped = false
+					if (args.every !== undefined && args.every.trim()) {
+						const requested = parseIntervalMs(args.every)
+						if (requested === undefined) {
+							throw new Error(`Could not parse the cadence "${args.every}". Use forms like "5m", "90s", "2h" (minimum 60s), or omit \`every\` for self-paced timing.`)
+						}
+						clamped = requested < LOOP_MIN_INTERVAL_MS
+						intervalMs = Math.max(requested, LOOP_MIN_INTERVAL_MS)
+					}
+					const maxIterations =
+						typeof args.max_iterations === "number" && Number.isFinite(args.max_iterations) && args.max_iterations >= 1
+							? Math.floor(args.max_iterations)
+							: LOOP_MAX_ITERATIONS
+					// One loop per session: replacing one cancels its pending timer first.
+					clearLoopTimer(sessionID)
+					const loop: LoopState = {
+						prompt: args.prompt.slice(0, MAX_CONDITION_CHARS),
+						...(args.until && args.until.trim() ? { until: args.until.slice(0, MAX_CONDITION_CHARS) } : {}),
+						...(intervalMs !== undefined ? { intervalMs } : {}),
+						iterations: 1,
+						maxIterations,
+						status: "active",
+						startedAt: Date.now(),
+					}
+					loops.set(sessionID, loop)
+					// The first iteration runs immediately; later ones follow the cadence.
+					const dispatched = await dispatchPrompt(sessionID, loop.prompt)
+					if (!dispatched) {
+						await endLoop(sessionID, loop, "stopped")
+						return "◎ Loop could not start: the session rejected the first prompt."
+					}
+					if (loop.iterations >= loop.maxIterations) {
+						// The cap was also the first iteration (e.g. max_iterations: 1).
+						await endLoop(sessionID, loop, "finished", loopCapNotice(loop))
+					} else {
+						scheduleNextRun(sessionID)
+					}
+					const cadence =
+						intervalMs !== undefined
+							? `every ${humanDuration(intervalMs)}${clamped ? " (raised to the 60s minimum)" : ""}`
+							: "self-paced (re-runs five minutes after each turn)"
+					const lines = [
+						`◎ Loop started (session-scoped). The prompt runs now and re-runs automatically.`,
+						`Prompt: ${loop.prompt}`,
+						`Cadence: ${cadence} · iteration 1 of ${maxIterations}`,
+					]
+					if (loop.until) {
+						lines.push(`Stop condition: ${loop.until} — judged by the evaluator after each turn; the loop ends when it holds.`)
+					} else {
+						lines.push(`No stop condition — the loop ends at ${maxIterations} iterations, or sooner via loop_stop.`)
+					}
+					return lines.join("\n")
 				},
 			}),
 
@@ -431,14 +663,32 @@ This tool backs the /loop command whenever its arguments are anything other than
 
 This is the /loop branch for the argument words "stop", "off", "cancel" and "clear". Report the output.`,
 				args: {},
-				async execute(_args, _context) {
-					throw new Error("NotImplemented: loop_stop")
+				async execute(_args, context) {
+					const sessionID = context.sessionID
+					clearLoopTimer(sessionID)
+					const loop = loops.get(sessionID)
+					if (!loop || loop.status !== "active") return "No active loop in this session."
+					await endLoop(sessionID, loop, "stopped")
+					return [
+						`◎ Loop stopped after ${loop.iterations} iteration${loop.iterations === 1 ? "" : "s"}.`,
+						`Prompt: ${loop.prompt}`,
+					].join("\n")
 				},
 			}),
 		},
 
 		async dispose() {
-			throw new Error("NotImplemented: dispose")
+			// Two schedulers must never run at once: cancel every loop timer this
+			// instance created and mark its loops stopped so no idle event
+			// re-arms or re-evaluates them.
+			for (const timer of loopTimers.values()) clearTimeout(timer)
+			loopTimers.clear()
+			for (const loop of loops.values()) {
+				if (loop.status === "active") {
+					loop.status = "stopped"
+					loop.endedAt = Date.now()
+				}
+			}
 		},
 	}
 }
@@ -448,4 +698,22 @@ function humanDuration(ms: number): string {
 	const m = Math.floor(ms / 60_000)
 	const s = Math.round((ms % 60_000) / 1000)
 	return `${m}m${s}s`
+}
+
+/** Parse a cadence like "5m", "90s" or "2h" into milliseconds. Returns undefined for unparseable input. */
+function parseIntervalMs(raw: string): number | undefined {
+	const m = raw.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?$/)
+	if (!m) return undefined
+	const n = Number(m[1])
+	if (!Number.isFinite(n) || n <= 0) return undefined
+	const unit = m[2] ?? "m"
+	const ms = unit === "ms" ? n : unit.startsWith("h") ? n * 3_600_000 : unit.startsWith("s") ? n * 1_000 : n * 60_000
+	return Math.round(ms)
+}
+
+const UNRECOVERABLE_ERROR_MARKERS = ["auth", "credential", "balance", "usage", "model"]
+
+/** Unrecoverable error classes end the goal/loop (like Claude Code); transient ones don't. */
+function isUnrecoverableErrorName(name: string): boolean {
+	return UNRECOVERABLE_ERROR_MARKERS.some((marker) => name.includes(marker))
 }
