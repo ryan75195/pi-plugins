@@ -6,6 +6,7 @@
   "repository": "github:ryan75195/pi-plugins",
   "license": "MIT",
   "scripts": {
+    "test": "node --test --test-concurrency=1 \"opencode/plugins/__tests__/*.test.ts\"",
     "typecheck": "tsc --noEmit --strict --target esnext --module esnext --moduleResolution bundler --skipLibCheck opencode/plugins/background-tasks.ts opencode/plugins/remote-control.ts extensions/background-tasks/index.ts",
     "install:opencode": "node scripts/install-opencode.js"
   },
