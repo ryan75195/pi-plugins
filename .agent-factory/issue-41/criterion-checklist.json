@@ -1,0 +1,55 @@
+{
+  "criteria": [
+    {
+      "id": "AC-1",
+      "criterion": "A loop can be started in a session with an optional fixed cadence (e.g. \"5m\", \"30s\") or self-paced timing, and it re-runs its prompt on that cadence until an optional stop condition is judged to hold or the iteration cap is reached.",
+      "plannedImplementation": "Port the loop machinery into opencode/plugins/goal.ts: a per-session loop record (prompt, optional until condition, optional fixed cadence or self-paced five-minute default, iteration counter, cap) plus a timers map keyed by sessionID that dispose() clears. The new `loop` tool (args: prompt, every?, until?, max_iterations?) dispatches the prompt into the session immediately, then re-dispatches on the parsed cadence (interval formats \"5m\"/\"90s\"/\"2h\" with a 60s floor) or five minutes after each turn when self-paced. Each dispatched turn ends in a session.idle evaluation of `until` by the same evaluator the goal uses (child session, MET/NOT_MET/IMPOSSIBLE); the loop terminalizes when the condition holds, when loop_stop is called, or when the iteration cap is reached (default 40, overridable via max_iterations).",
+      "plannedVerification": "opencode/plugins/__tests__/loop-cadence.test.ts drives GoalPlugin with a fake SDK client and node:test mock timers, asserting observable prompt-dispatch counts: one dispatch at start; no re-run before the cadence elapses and exactly one re-run at \"5m\", \"90s\", and \"2h\"; \"10s\" clamped to the 60s floor (no run at 10s, run at 60s); self-paced re-run five minutes after the turn's idle; a stop exactly at max_iterations: 2; and a no-until loop stopping at the default 40-iteration cap with no further runs after it.",
+      "materialConcerns": [
+        "the evaluator is a paid call per turn, so the iteration cap and the 60s cadence floor are token-safety boundaries that must survive the port",
+        "public-contract compatibility: the loop tool's name and argument words (prompt, every, until, max_iterations) are load-bearing for the user's /loop command and the system prompt"
+      ],
+      "comparison": false,
+      "verificationStatus": "planned"
+    },
+    {
+      "id": "AC-2",
+      "criterion": "A finished, stopped, or failed loop or goal never starts another turn: terminal states end silently, matching the repo plugin's existing terminal handling rather than the config copy's dispatch-on-terminal behavior.",
+      "plannedImplementation": "The ported loop inherits the repo plugin's own terminal pattern (goal.ts's idle handler returns without dispatching on any non-active state): once a loop terminalizes (until judged MET, iteration cap, or loop_stop) its timer is cleared, its state goes terminal, and further session.idle events and cadence ticks dispatch nothing. The goal side already behaves this way and must not regress.",
+      "plannedVerification": "opencode/plugins/__tests__/terminal-silence.test.ts drives each terminal path and asserts silence: after a loop's until is judged MET (evaluator prompt carries the until text; any stop notice is dispatched at most once), after loop_stop, after a goal achieved (MET), after a goal marked IMPOSSIBLE, and after goal_clear, repeated session.idle events plus advanced mock cadence ticks produce zero further promptAsync dispatches. This is the regression guard for the config copy's storm bug (a finished loop re-dispatching its stop prompt 20+ times in 90s).",
+      "materialConcerns": [
+        "the config copy's dispatch-on-terminal storm is the exact regression this criterion forbids; the test pins flat dispatch counts after terminal",
+        "dispose() must cancel every loop timer it created so two schedulers never run at once after the config swap"
+      ],
+      "comparison": false,
+      "verificationStatus": "planned"
+    },
+    {
+      "id": "AC-3",
+      "criterion": "The repo plugin registers the goal and loop tools exactly once each, with no name collisions and no second registration of the same tool name, and its system-prompt guidance covers both the goal and loop primitives.",
+      "plannedImplementation": "The merged plugin's returned tool map carries goal_set, goal_status, goal_clear, loop, and loop_stop exactly once each (unique keys, executable bodies), and experimental.chat.system.transform pushes guidance that names the goal primitive (goal_set) and the loop primitive (loop / loop_stop), keeping the existing once-guarded push so repeated transforms never duplicate sections.",
+      "plannedVerification": "opencode/plugins/__tests__/tool-registration.test.ts asserts the five tool names are present in the plugin's tool map with no duplicate keys and each with an execute function; a single transform call emits system-prompt text naming goal_set, loop, and loop_stop; and a second transform call does not duplicate the goal section or the loop mentions.",
+      "materialConcerns": [
+        "public-contract compatibility: duplicate tool registration or renamed tools would silently break the /goal and /loop command surfaces and the system-prompt contract documented in opencode/README.md"
+      ],
+      "comparison": false,
+      "verificationStatus": "planned"
+    },
+    {
+      "id": "AC-4",
+      "criterion": "Existing /goal behavior is unchanged: set, status, clear, the no-tool-streak pause, turn caps, and idle deferral all behave as before.",
+      "plannedImplementation": "No behavior change to goal_set, goal_status, goal_clear, the idle evaluator path, MAX_NO_TOOL_STREAK = 3 pause, MAX_TURNS = 40 cap, or MAX_IDLE_DEFERRALS = 3 deferral; the loop machinery is added alongside these paths without altering them, and the /goal command surface and its argument words stay untouched.",
+      "plannedVerification": "opencode/plugins/__tests__/goal-regression.test.ts pins the current behavior against a fake client: goal_set returns the Goal set confirmation with the condition and goal_status reports active with turns evaluated: 0; goal_clear reports Goal cleared: <condition> and status shows paused; three tool-less turns produce the Goal paused message and then silence; forty NOT_MET evaluations produce the stopped after 40 turns message and then silence; and with a running background task seeded in the shared state file, three idles defer evaluation (no evaluator child session) and the fourth evaluates (child prompt contains the condition). These tests pass at base and must keep passing.",
+      "materialConcerns": [
+        "public-contract compatibility: /goal command surface, argument words, and message wording must not drift",
+        "persistence compatibility: the shared state.json under tmpdir is merged across plugin instances and read by the TUI goal indicator, so the merge-persist semantics and record shape must stay compatible"
+      ],
+      "comparison": true,
+      "comparisonObservation": {
+        "firstObservation": "Baseline observed in opencode/plugins/goal.ts today: goal_set returns \"◎ Goal set (session-scoped)…\" echoing the condition; goal_status reports \"◎ Goal active\" with \"turns evaluated: 0\"; goal_clear returns \"Goal cleared: <condition>\" and goal_status then shows \"◎ Goal paused\"; three consecutive tool-less turns deliver \"◎ Goal paused: 3 turns without tool use…\"; forty NOT_MET evaluations deliver \"◎ Goal stopped after 40 turns…\"; with a running background task for the session, evaluation is deferred for the first three idle events and happens on the fourth.",
+        "whenHeldValueAbsent": "When no goal is held for the session, goal_status reports \"No goal set for this session.\" and goal_clear reports \"No goal set.\", so the regression tests always seed a goal before comparing behavior; when the seeded background-task state file is absent, backgroundWorkRunning returns false and evaluation is not deferred, which is itself part of the baseline being pinned."
+      },
+      "verificationStatus": "planned"
+    }
+  ]
+}
