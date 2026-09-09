@@ -1,0 +1,11 @@
+{
+  "testGateable": true,
+  "testCommand": "node --no-warnings --test --test-concurrency=1 opencode/plugins/__tests__/loop-cadence.test.ts opencode/plugins/__tests__/terminal-silence.test.ts opencode/plugins/__tests__/tool-registration.test.ts opencode/plugins/__tests__/goal-regression.test.ts",
+  "rationale": "The repo has no test framework, so the contract runs the four contract files directly on node's built-in test runner (Node >= 22.18 loads these TypeScript files via type stripping; --test-concurrency=1 serialises the files because they share tmpdir state paths). Each file pins one acceptance criterion as observable behaviour of the real GoalPlugin factory driven by a fake SDK client (opencode/plugins/__tests__/helpers.ts): loop-cadence.test.ts pins AC-1 (prompt dispatched at start, re-run at '5m'/'90s'/'2h' cadences, '10s' clamped to the 60s floor, self-paced re-run five minutes after each turn, stop at max_iterations 2 and at the default 40 cap, judged on node:test's mocked clock); terminal-silence.test.ts pins AC-2 (finished/loop_stop/disposed loops and achieved/impossible/cleared goals dispatch nothing on further idles or cadence ticks, the until condition reaches the evaluator, and the stop is announced at most once); tool-registration.test.ts pins AC-3 (goal_set/goal_status/goal_clear/loop/loop_stop registered exactly once each with executable bodies, and system-prompt guidance covering both primitives without duplication on repeated transforms); goal-regression.test.ts pins AC-4 (set/status/clear outputs, the three-strike no-tool pause, the 40-turn cap, and background-work deferral with evaluation on the fourth idle all behave exactly as today). At base the suite is red for the right reason only: every failure is the declared 'NotImplemented: loop'/'loop_stop'/'dispose' stubs in opencode/plugins/goal.ts or the missing loop guidance, and the ten /goal regression and goal-terminal pins pass at base. A reference implementation was used to validate the contract end-to-end (21/21 pass) and reverted before handoff, so the declared shape is known satisfiable without leaving behaviour behind.",
+  "shapePaths": [
+    "opencode/plugins/goal.ts"
+  ],
+  "shapePathCitations": {
+    "opencode/plugins/goal.ts": ["AC-1", "AC-2", "AC-3"]
+  }
+}

@@ -22,6 +22,10 @@
  *      until the user prompts again. A deferred evaluation (background work
  *      still running) re-checks when the background task completes.
  *
+ * The same machinery also hosts the loop primitive (the /loop tool): a prompt
+ * re-run on a fixed cadence or self-paced, with an optional until stop
+ * condition judged by the same evaluator and an iteration cap.
+ *
  * The sidebar (opencode/tui/goal-indicator.tsx) shows the live goal state via
  * a shared state file.
  */
@@ -402,6 +406,39 @@ This is the /goal branch for the argument words "clear", "stop", "off", "reset",
 					return `Goal cleared: ${goal.condition}`
 				},
 			}),
+
+			loop: tool({
+				description: `Start a self-driving loop for this session: the given prompt is run again and again without per-step prompting. Each iteration is dispatched into this session as a message; after each turn an evaluator (the same one /goal uses) judges the optional \`until\` stop condition and the loop ends when it holds, when the iteration cap is reached, or when loop_stop is called.
+
+This tool backs the /loop command whenever its arguments are anything other than empty, "status", or a stop word. Call it FIRST, before any other work, passing the user's words as \`prompt\`:
+- prompt: what to do on every iteration (required).
+- every: fixed cadence between iterations, e.g. "5m", "90s", "2h" (minimum one minute). Omit it for self-paced timing: the prompt re-runs five minutes after each turn.
+- until: the stop condition, verifiable from the conversation; the loop ends as soon as the evaluator judges it met.
+- max_iterations: hard cap on iterations (default 40) so an unbounded loop cannot burn tokens.`,
+				args: {
+					prompt: tool.schema.string().describe("The prompt re-run on every iteration, taken from the /loop arguments."),
+					every: tool.schema.string().optional().describe("Fixed cadence between iterations, e.g. \"5m\", \"90s\", \"2h\"; minimum 60s. Omit for self-paced timing: five minutes after each turn."),
+					until: tool.schema.string().optional().describe("Optional stop condition, judged by the same evaluator as /goal; the loop stops once it holds."),
+					max_iterations: tool.schema.number().optional().describe("Stop after this many iterations (default 40)."),
+				},
+				async execute(_args, _context) {
+					throw new Error("NotImplemented: loop")
+				},
+			}),
+
+			loop_stop: tool({
+				description: `Stop the active loop in this session (one started with the loop tool). The loop's timer is cancelled and no further iterations are dispatched.
+
+This is the /loop branch for the argument words "stop", "off", "cancel" and "clear". Report the output.`,
+				args: {},
+				async execute(_args, _context) {
+					throw new Error("NotImplemented: loop_stop")
+				},
+			}),
+		},
+
+		async dispose() {
+			throw new Error("NotImplemented: dispose")
 		},
 	}
 }
