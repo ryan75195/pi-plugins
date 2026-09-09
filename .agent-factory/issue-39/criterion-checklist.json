@@ -1,0 +1,66 @@
+{
+  "criteria": [
+    {
+      "id": "AC-1",
+      "criterion": "A token-authenticated remote client can delete one of the instance's sessions by id through the instance's remote-control server, and afterwards that session no longer appears when the client lists sessions.",
+      "plannedImplementation": "Add a DELETE case to the per-instance session dispatch (parts.length === 2, method DELETE) in makeInstanceRouteHandler in opencode/plugins/remote-control.ts, proxying client.session.delete({ path: { id }, query: { directory } }) through the existing sdk() envelope exactly like the PATCH rename and POST abort routes do, so a successful SDK delete resolves 200. The dispatch is reached through the newly exported makeInstanceRouteHandler factory that the plugin's makeHandler delegates to.",
+      "plannedVerification": "opencode/test/sessionDelete.removesSessionFromListings.test.ts seeds the in-memory fake opencode with two sessions, deletes the doomed one through the instance handler with the instance token, expects 200, then GETs /session and expects the doomed session absent while the survivor remains. The fake validates that every proxied call carries query.directory equal to the instance directory and deletes strictly by path.id, so a mis-shaped proxy call fails the test instead of passing silently.",
+      "materialConcerns": [
+        "data loss (session deletion is permanent; this ticket provides only the capability, the confirmation guard belongs to the client ticket)",
+        "public-contract compatibility (new whitelist entry on the per-instance route dispatch)"
+      ],
+      "verificationStatus": "planned",
+      "comparison": true,
+      "comparisonObservation": {
+        "firstObservation": "Before deletion the doomed session appears in the authenticated GET /session listing of the instance (it is seeded in the fake opencode store the SDK client talks to).",
+        "whenHeldValueAbsent": "Once a session id has been deleted (or never existed) it is simply omitted from the listing payload - no tombstone entry and no listing error is produced."
+      }
+    },
+    {
+      "id": "AC-2",
+      "criterion": "The deletion is observable by a live listener: a client subscribed to the instance's event stream learns the session was removed without polling.",
+      "plannedImplementation": "No new forwarding work: the /event proxy already forwards every event type untouched, and opencode itself emits session.deleted when the SDK delete succeeds. The existing forwarding logic moves into the exported openInstanceEventStream (backs GET /event) and forwardInstanceEvent (the plugin event hook's body), which the tests drive directly so the propagation is exercised for real.",
+      "plannedVerification": "opencode/test/sessionDelete.pushesRemovalToEventStream.test.ts subscribes to GET /event with a valid token (consuming the real SSE ReadableStream), deletes a session through the handler, and asserts the subscriber receives a data frame whose payload deep-equals the event the fake opencode emitted on delete (the real EventSessionDeleted shape: type session.deleted with properties.info.id naming the deleted session). It also asserts the fake recorded zero session.list calls, proving the listener learned of the removal by push rather than by polling.",
+      "materialConcerns": [
+        "public-contract compatibility (SSE frames must keep the { directory, payload } wrapper and untouched event payloads that existing app clients parse)"
+      ],
+      "verificationStatus": "planned",
+      "comparison": false
+    },
+    {
+      "id": "AC-3",
+      "criterion": "Deleting an unknown session id fails the same way the server's existing session routes fail for unknown sessions, rather than succeeding silently.",
+      "plannedImplementation": "The DELETE case proxies through the same sdk() envelope as every other per-id session route, so an upstream error result (the SDK's 404 NotFoundError for an unknown session id) is re-emitted with the upstream status and error body instead of being swallowed.",
+      "plannedVerification": "opencode/test/sessionDelete.unknownIdFailsLikeExistingRoutes.test.ts sends DELETE /session/<unknown> and POST /session/<unknown>/abort (an existing per-id route used as the prior-art control) against the same fake opencode, and asserts both responses carry the same status and the same JSON error body. Body equality with the existing route is the 'fails the same way' assertion; today the unhandled DELETE falls through to the generic 404 {\"error\":\"not found\"} body, so the test is red until the route proxies.",
+      "materialConcerns": [],
+      "verificationStatus": "planned",
+      "comparison": false
+    },
+    {
+      "id": "AC-4",
+      "criterion": "Requests without valid token auth are rejected exactly like every other route on this server.",
+      "plannedImplementation": "The DELETE case lives inside the same dispatch whose entry runs authorizedInstance(req, tok) (instance token or durable pairing token, via query t, x-oc-token header or Basic auth) before any route executes, so it inherits the identical 401 rejection without extra code.",
+      "plannedVerification": "opencode/test/sessionDelete.rejectsUnauthenticatedRequests.test.ts asserts DELETE /session/<id> with no token and with a wrong token return the exact status and body that GET /session with no token returns (401 with {\"error\":\"unauthorized\"}), and as a positive control that DELETE with the valid instance token is not rejected as unauthorized.",
+      "materialConcerns": [
+        "security boundaries (the new route must not widen auth beyond the existing instance/pairing token check)"
+      ],
+      "verificationStatus": "planned",
+      "comparison": false
+    },
+    {
+      "id": "AC-5",
+      "criterion": "All existing proxied session capabilities (listing, creation, rename, messages, prompting, abort, commands, permissions) keep working unchanged.",
+      "plannedImplementation": "The dispatch body moves verbatim from the plugin's makeHandler into the exported makeInstanceRouteHandler; only the DELETE case is added. Every existing route (GET/POST /session, PATCH /session/:id, GET /session/:id/message, POST /session/:id/prompt_async, POST /session/:id/abort, POST /session/:id/command, POST /session/:id/permissions/:permissionID) keeps its current request parsing and sdk() proxying.",
+      "plannedVerification": "opencode/test/proxiedSessionRoutes.remainAvailable.test.ts drives all eight proxied capabilities through the handler against the fake opencode and asserts the observable outcomes they produce today: list returns seeded rows, create adds a session to the store, rename persists the new title, messages returns the seeded transcript, prompt_async records the cleaned prompt parts, abort records the aborted session, command records the command call, and permissions records the reply - each answering 200.",
+      "materialConcerns": [
+        "public-contract compatibility (regression net over every existing proxied capability; the dispatch body must move behaviour-identically)"
+      ],
+      "verificationStatus": "planned",
+      "comparison": true,
+      "comparisonObservation": {
+        "firstObservation": "At the observed baseline each proxied capability answers 200 and produces its store effect through the fake opencode: rows listed, session created, title changed, messages returned, prompt/abort/command/permission recorded.",
+        "whenHeldValueAbsent": "If a proxied capability were missing from the dispatch, its request falls through to the generic 404 {\"error\":\"not found\"} response and the store effect never happens."
+      }
+    }
+  ]
+}
