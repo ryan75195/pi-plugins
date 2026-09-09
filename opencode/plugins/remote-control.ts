@@ -498,10 +498,11 @@ export type InstanceRouteDeps = {
   listSessions: () => Promise<SessionRow[]>
   messagesOf: (sessionID: string) => Promise<Array<{ role: string; text: string }>>
   questionProxy: (path: string, body?: unknown) => Promise<Response>
+  disconnect: () => void
 }
 
 export function makeInstanceRouteHandler(deps: InstanceRouteDeps): (req: Request) => Promise<Response> {
-  const { client, directory, token: tok, getState, listSessions, messagesOf, questionProxy } = deps
+  const { client, directory, token: tok, getState, listSessions, messagesOf, questionProxy, disconnect } = deps
 
   const sdk = async (
     run: () => Promise<{ data?: unknown; error?: unknown; response?: { status?: number } }>,
@@ -519,6 +520,14 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps): (req: Request
       return new Response(CLIENT_HTML, { headers: { "content-type": "text/html; charset=utf-8" } })
     }
     if (!authorizedInstance(req, tok)) return json({ error: "unauthorized" }, 401)
+
+    // Authenticated disconnect: same contract as /remote-control off. The
+    // response goes out first and stop() runs a beat later, because stop()
+    // closes the very server that is answering this request.
+    if (seg === "/disconnect" && req.method === "POST") {
+      setTimeout(disconnect, 100)
+      return json({ ok: true, detail: "Remote Control off. Local session unaffected." })
+    }
 
     // Native opencode REST surface so native clients (opencode-ios, any REST
     // app) can manage this TUI's sessions through the tunnel. Auth: Basic
@@ -1189,6 +1198,7 @@ export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl
       listSessions,
       messagesOf,
       questionProxy,
+      disconnect: stop,
     })
   }
 
