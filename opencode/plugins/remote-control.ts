@@ -22,7 +22,7 @@ import type { FilePartInput, TextPartInput } from "@opencode-ai/sdk"
 import { tool } from "@opencode-ai/plugin"
 import { createHash, randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { basename, join } from "node:path"
 import { homedir, hostname } from "node:os"
 import { connect } from "node:net"
@@ -184,31 +184,126 @@ let openEventStreams = 0
  * each instance may only modify its own entry. The mount used for a stop is
  * taken from memory (the starting process knows it); the file is advisory,
  * for `status` and cross-instance visibility.
+ *
+ * A phone bounce closes every instance's upstream stream within the same
+ * millisecond, so several processes rewrite this file concurrently. An
+ * unlocked read-modify-write loses entries to last-writer-wins and the
+ * sidebar then shows phantom or missing connections. All mutations therefore
+ * run inside a cross-process lock, drop registrations whose pid is gone, and
+ * stay advisory: a failed or timed-out write must never take down an event
+ * stream.
  */
 function persistRegistrations(regs: RemoteState[]) {
   mkdirSync(STATE_DIR, { recursive: true })
   writeFileSync(STATE_FILE, JSON.stringify({ updatedAt: Date.now(), registrations: regs }, null, 2))
 }
 
+const LOCK_FILE = join(STATE_DIR, "state.lock")
+const LOCK_STEAL_MS = 500
+const LOCK_TIMEOUT_MS = 3_000
+const LOCK_RETRY_MS = 10
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function lockHolder(): string {
+  try {
+    return readFileSync(LOCK_FILE, "utf8")
+  } catch {
+    return ""
+  }
+}
+
+function stealStaleLock(): void {
+  const [holderPid, stampedAt] = lockHolder().split(" ")
+  const age = Date.now() - Number(stampedAt)
+  if (!Number.isFinite(age) || age < LOCK_STEAL_MS) return
+  try {
+    unlinkSync(LOCK_FILE)
+    log(`stale state lock stolen (held by pid ${holderPid ?? "?"})`)
+  } catch {
+    /* another process stole or released it first */
+  }
+}
+
+function withStateLock<T>(work: () => T): T | undefined {
+  mkdirSync(STATE_DIR, { recursive: true })
+  const deadline = Date.now() + LOCK_TIMEOUT_MS
+  for (;;) {
+    let fd: number
+    try {
+      fd = openSync(LOCK_FILE, "wx")
+    } catch {
+      if (Date.now() > deadline) {
+        log(`state lock timed out after ${LOCK_TIMEOUT_MS}ms; registration write dropped`)
+        return undefined
+      }
+      stealStaleLock()
+      sleepSync(LOCK_RETRY_MS)
+      continue
+    }
+    try {
+      writeFileSync(fd, `${process.pid} ${Date.now()}`)
+      return work()
+    } finally {
+      try {
+        closeSync(fd)
+        if (lockHolder().startsWith(`${process.pid} `)) unlinkSync(LOCK_FILE)
+      } catch {
+        /* the lock file is already handled elsewhere */
+      }
+    }
+  }
+}
+
+function pruneDeadRegistrations(regs: RemoteState[]): RemoteState[] {
+  return regs.filter((r) => r.pid === process.pid || pidAlive(r.pid))
+}
+
+function updateRegistrations(mutate: (regs: RemoteState[]) => RemoteState[]): void {
+  withStateLock(() => {
+    persistRegistrations(pruneDeadRegistrations(mutate(loadRegistrations())))
+  })
+}
+
+export { updateRegistrations }
+
 /**
  * Mirror the live subscriber count into this process's entry so anything
  * reading the state file — the TUI sidebar, `status` — can tell "registered"
- * from "a phone is actually attached". Best effort by design: a failed write
- * must never take down an event stream.
+ * from "a phone is actually attached". Re-adds the entry if a clobber from an
+ * older build removed it. Best effort by design: a failed write must never
+ * take down an event stream.
  */
 function persistClientCount(): void {
   try {
-    if (!activeState) return
-    activeState.clients = openEventStreams
-    activeState.updatedAt = Date.now()
-    const regs = loadRegistrations()
-    const index = regs.findIndex((r) => r.pid === process.pid)
-    if (index === -1) return
-    regs[index] = { ...regs[index], ...activeState }
-    persistRegistrations(regs)
+    const snapshot = activeState
+    if (!snapshot) return
+    updateRegistrations((regs) => {
+      const entry = { ...snapshot, clients: openEventStreams, updatedAt: Date.now() }
+      const index = regs.findIndex((r) => r.pid === process.pid)
+      if (index === -1) return [...regs, entry]
+      return regs.map((r, i) => (i === index ? { ...r, ...entry } : r))
+    })
   } catch {
     /* advisory only */
   }
+}
+
+const HEARTBEAT_MS = 5_000
+let heartbeat: ReturnType<typeof setInterval> | undefined
+
+function startHeartbeat(): void {
+  if (heartbeat) return
+  heartbeat = setInterval(() => persistClientCount(), HEARTBEAT_MS)
+  heartbeat.unref?.()
+}
+
+function stopHeartbeat(): void {
+  if (!heartbeat) return
+  clearInterval(heartbeat)
+  heartbeat = undefined
 }
 
 function log(message: string): void {
@@ -332,9 +427,7 @@ async function pruneStale(): Promise<void> {
     }
   }
   // 2. Dead-pid registrations.
-  const regs = loadRegistrations()
-  const alive = regs.filter((r) => pidAlive(r.pid))
-  if (alive.length !== regs.length) persistRegistrations(alive)
+  if (loadRegistrations().some((r) => !pidAlive(r.pid))) updateRegistrations((regs) => regs)
 }
 
 const TAILSCALE_CANDIDATES = process.platform === "win32"
@@ -1257,9 +1350,8 @@ ${serve.out}`
     state.host = host
     state.url = `https://${host}${mount}/?t=${tok}`
     activeState = state
-    const regs = loadRegistrations().filter((r) => r.pid !== process.pid)
-    regs.push(state)
-    persistRegistrations(regs)
+    updateRegistrations((regs) => [...regs.filter((r) => r.pid !== process.pid), state])
+    startHeartbeat()
     startedHere = true
     // The hub is per machine, not per instance: publish the mount every time
     // (idempotent) and take the port if nobody holds it yet.
@@ -1291,10 +1383,11 @@ ${serve.out}`
     sseClients.clear()
     if (!startedHere) return "Remote Control was not active in this process."
     startedHere = false
+    stopHeartbeat()
     // Our mount is known in memory — never trust the shared file for this.
     const mount = activeState?.mount
     activeState = undefined
-    persistRegistrations(loadRegistrations().filter((r) => r.pid !== process.pid))
+    updateRegistrations((regs) => regs.filter((r) => r.pid !== process.pid))
     log(`stop mount=${mount ?? "-"}`)
     // Targeted removal of OUR path only. The root is never ours to remove.
     const r =
