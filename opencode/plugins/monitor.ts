@@ -177,7 +177,7 @@ export const MonitorPlugin: Plugin = async ({ client, directory }) => {
     try {
       await client.session.promptAsync({
         path: { id: w.sessionID },
-        body: { parts: [{ type: "text", text }] },
+        body: { parts: [{ type: "text", text, metadata: { machinePushed: true } }] },
         query: { directory: w.directory },
       })
     } catch {

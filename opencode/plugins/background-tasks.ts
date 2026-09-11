@@ -186,7 +186,7 @@ export const BackgroundTasksPlugin: Plugin = async ({ client, directory }) => {
 			await client.session.promptAsync({
 				path: { id: sessionID },
 				body: {
-					parts: [{ type: "text", text }],
+					parts: [{ type: "text", text, metadata: { machinePushed: true } }],
 				},
 				query: { directory },
 			})

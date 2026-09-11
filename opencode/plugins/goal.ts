@@ -307,7 +307,7 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 		try {
 			await client.session.promptAsync({
 				path: { id: sessionID },
-				body: { parts: [{ type: "text", text }] },
+				body: { parts: [{ type: "text", text, metadata: { machinePushed: true } }] },
 				query: { directory },
 			})
 		} catch {
@@ -362,7 +362,7 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 		try {
 			await client.session.promptAsync({
 				path: { id: sessionID },
-				body: { parts: [{ type: "text", text }] },
+				body: { parts: [{ type: "text", text, metadata: { machinePushed: true } }] },
 				query: { directory },
 			})
 			return true
