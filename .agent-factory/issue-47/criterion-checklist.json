@@ -1,0 +1,61 @@
+{
+  "criteria": [
+    {
+      "id": "AC-1",
+      "criterion": "A prompt pushed by the loop, goal, monitor and background-task machinery still reaches the model and still drives the turn exactly as it does today.",
+      "plannedImplementation": "Keep every push on client.session.promptAsync with a text part carrying the same text as before, and never set the excluded-from-context flags (synthetic/ignored) on that part. Only add the machine-pushed marker to part metadata; the text and the push mechanism are untouched. The marker must live on metadata, which opencode persists but does not feed to the model, rather than on synthetic/ignored, which opencode excludes from model context.",
+      "plannedVerification": "opencode/plugins/__tests__/PushedPrompts.stillReachTheModel.test.ts drives the real GoalPlugin (goal evaluation notice and loop iteration), MonitorPlugin (watch event) and BackgroundTasksPlugin (completion notification) against a fake client and asserts that each push arrives through session.promptAsync as a text part carrying the expected text and with synthetic !== true and ignored !== true. At base these four tests pass (delivery is today's behaviour); they guard against a marker implementation that removes the prompt from the model context.",
+      "materialConcerns": [
+        "model-context preservation: a marker set via synthetic/ignored would drop the pushed text from the model context and break the loop, so the tests pin that the pushed part is model-visible",
+        "public-contract compatibility: promptAsync is the only mechanism that starts a turn and the four dispatch sites depend on it"
+      ],
+      "comparison": true,
+      "comparisonObservation": {
+        "firstObservation": "On the first observation each dispatch site still calls session.promptAsync with an ordinary text part whose text is the pushed prompt (goal notice, loop prompt, monitor event, background completion), which is the pre-change baseline.",
+        "whenHeldValueAbsent": "When no held baseline is available the tests still require the same delivery shape directly: the pushed text must be present as a text part and must not be marked synthetic or ignored, so a missing baseline cannot hide a context-excluding marker."
+      },
+      "verificationStatus": "planned"
+    },
+    {
+      "id": "AC-2",
+      "criterion": "Each such pushed prompt is stored carrying a marker identifying it as machine-pushed, visible to a client reading the message.",
+      "plannedImplementation": "Attach a metadata marker to the pushed text part at all four dispatch sites: goal.ts deliver (goal and loop notices) and dispatchPrompt (loop iterations), monitor.ts deliver (watch events), and background-tasks.ts deliverNotification (task completions). The contract fixes the marker as metadata.machinePushed === true, which opencode persists on TextPart and returns to clients reading session messages; it does not alter the part's text or model visibility.",
+      "plannedVerification": "opencode/plugins/__tests__/PushedPrompts.carryMachinePushedMetadata.test.ts asserts, for the goal evaluation notice, the loop iteration prompt, the monitor event and the background-task completion, that the text part carrying the pushed text has metadata.machinePushed === true and that its text is still non-empty. At base all four fail because none of the dispatch sites set metadata.",
+      "materialConcerns": [
+        "persistence compatibility: metadata is a persisted TextPart field, so the marker survives session storage and reaches clients reading session.messages",
+        "release impact: the installed plugin copies under the user's config directory are separate from this repository and must be refreshed with npm run install:opencode after merge",
+        "public-contract compatibility: the marker key becomes the contract a client collapses on, so changing it later breaks the client"
+      ],
+      "comparison": false,
+      "verificationStatus": "planned"
+    },
+    {
+      "id": "AC-3",
+      "criterion": "A prompt the user types carries no such marker.",
+      "plannedImplementation": "Mark only the plugin's own push sites, never the user-input path. The phone client submits user prompts through remote-control.ts's /api/send route, which rebuilds parts field-by-field and forwards a plain text part; that route must stay unmarked so a user prompt is distinguishable from a machine push.",
+      "plannedVerification": "opencode/plugins/__tests__/PushedPrompts.userTypedPromptsStayUnmarked.test.ts posts a user-typed prompt through the real remote-control /api/send route and asserts the forwarded text part has no machine-pushed marker, while a machine goal push in the same test does carry it as the positive control. The positive control fails at base, proving the marker is opt-in rather than a blanket mutation.",
+      "materialConcerns": [
+        "security/trust boundary: /api/send input is untrusted and is already rebuilt field-by-field, so user input cannot inject the machine-pushed marker",
+        "public-contract compatibility: the /api/send route is the phone client's user-prompt surface and must keep forwarding plain user text"
+      ],
+      "comparison": false,
+      "verificationStatus": "planned"
+    },
+    {
+      "id": "AC-4",
+      "criterion": "The loop, goal, monitor and background-task behaviours are otherwise unchanged.",
+      "plannedImplementation": "The marker is metadata-only: pushed text bodies, message wording and formats are left byte-for-byte as they are, and the goal/loop timing, cap, pause, deferral and terminal-silence machinery is untouched.",
+      "plannedVerification": "opencode/plugins/__tests__/PushedPrompts.machineryOutputUnchanged.test.ts pins that the goal NOT YET MET notice keeps its wording and condition, the loop prompt is delivered verbatim, the monitor event keeps its [monitor ...] ended format, and the background completion keeps its Background task ... completed format, with no marker text leaking into the body. The pre-existing checks opencode/plugins/__tests__/goal-regression.test.ts (set/status/clear, three-turn pause, forty-turn cap, idle deferral), loop-cadence.test.ts (immediate run, fixed/self-paced cadence, 60s floor, iteration caps) and terminal-silence.test.ts (terminal loops/goals dispatch nothing) continue to pin the unchanged timing and terminal behaviour and remain green.",
+      "materialConcerns": [
+        "public-contract compatibility: the push wording and formats are read by the agent and asserted by existing tests, so they must not drift",
+        "persistence compatibility: adding metadata must not change the shared state files the goal and TUI read"
+      ],
+      "comparison": true,
+      "comparisonObservation": {
+        "firstObservation": "On the first observation the pushed bodies keep the exact pre-change wording and format: the goal notice says NOT YET MET and carries the condition, the loop prompt is verbatim, the monitor event starts with [monitor  and says ended:, and the background completion starts with Background task  and says completed.",
+        "whenHeldValueAbsent": "When no held baseline is available the tests pin those formats directly, so the absence of a baseline cannot let a format drift or marker text leak pass."
+      },
+      "verificationStatus": "planned"
+    }
+  ]
+}

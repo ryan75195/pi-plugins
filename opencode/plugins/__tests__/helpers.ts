@@ -10,6 +10,7 @@ import { GoalPlugin } from "../goal.ts"
 import { rmSync, mkdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { CapturedPart } from "./pushedPrompts.ts"
 
 export const GOAL_STATE_DIR = join(tmpdir(), "opencode-goal")
 export const BACKGROUND_TASKS_STATE_FILE = join(tmpdir(), "opencode-background-tasks", "state.json")
@@ -32,7 +33,8 @@ export function seedRunningBackgroundTask(sessionID: string): void {
 export interface Harness {
 	plugin: any
 	calls: {
-		dispatched: Array<{ sessionID: string; text: string }>
+		/** Every promptAsync push, with the raw parts so metadata markers stay observable. */
+		dispatched: Array<{ sessionID: string; text: string; parts: CapturedPart[] }>
 		evaluatorSessions: string[]
 		evaluatorPrompts: string[]
 	}
@@ -50,7 +52,7 @@ export const DEFAULT_VERDICT = "NOT_MET: the condition is not satisfied yet"
 export async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
 	resetStateDirs()
 	const calls = {
-		dispatched: [] as Array<{ sessionID: string; text: string }>,
+		dispatched: [] as Array<{ sessionID: string; text: string; parts: CapturedPart[] }>,
 		evaluatorSessions: [] as string[],
 		evaluatorPrompts: [] as string[],
 	}
@@ -73,11 +75,12 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
 				return { data: { parts: [{ type: "text", text: reply }] } }
 			},
 			promptAsync: async (request: any) => {
-				const text = (request?.body?.parts ?? [])
+				const parts = (request?.body?.parts ?? []) as CapturedPart[]
+				const text = parts
 					.filter((p: any) => p?.type === "text")
 					.map((p: any) => p.text)
 					.join("\n")
-				calls.dispatched.push({ sessionID: request?.path?.id, text })
+				calls.dispatched.push({ sessionID: request?.path?.id, text, parts })
 				return {}
 			},
 		},
