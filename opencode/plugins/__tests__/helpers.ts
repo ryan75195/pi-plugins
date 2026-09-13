@@ -33,6 +33,7 @@ export interface Harness {
 	plugin: any
 	calls: {
 		dispatched: Array<{ sessionID: string; text: string }>
+		dispatchedParts: Array<{ sessionID: string; parts: Array<any> }>
 		evaluatorSessions: string[]
 		evaluatorPrompts: string[]
 	}
@@ -51,6 +52,7 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
 	resetStateDirs()
 	const calls = {
 		dispatched: [] as Array<{ sessionID: string; text: string }>,
+		dispatchedParts: [] as Array<{ sessionID: string; parts: Array<any> }>,
 		evaluatorSessions: [] as string[],
 		evaluatorPrompts: [] as string[],
 	}
@@ -72,14 +74,16 @@ export async function makeHarness(options: HarnessOptions = {}): Promise<Harness
 				const reply = verdictQueue.length > 0 ? verdictQueue.shift() : (options.verdicts?.[options.verdicts.length - 1] ?? DEFAULT_VERDICT)
 				return { data: { parts: [{ type: "text", text: reply }] } }
 			},
-			promptAsync: async (request: any) => {
-				const text = (request?.body?.parts ?? [])
-					.filter((p: any) => p?.type === "text")
-					.map((p: any) => p.text)
-					.join("\n")
-				calls.dispatched.push({ sessionID: request?.path?.id, text })
-				return {}
-			},
+		promptAsync: async (request: any) => {
+			const parts = request?.body?.parts ?? []
+			const text = parts
+				.filter((p: any) => p?.type === "text")
+				.map((p: any) => p.text)
+				.join("\n")
+			calls.dispatched.push({ sessionID: request?.path?.id, text })
+			calls.dispatchedParts.push({ sessionID: request?.path?.id, parts })
+			return {}
+		},
 		},
 	}
 	const plugin: any = await GoalPlugin({ client, directory: "/work/repo" })
