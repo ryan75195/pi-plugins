@@ -46,6 +46,13 @@ const MAX_TURNS = 40 // hard cap: a goal that never resolves stops after this ma
 const LOOP_DEFAULT_INTERVAL_MS = 5 * 60_000 // self-paced default: re-run five minutes after each turn
 const LOOP_MIN_INTERVAL_MS = 60_000 // token-safety floor for fixed cadences (no sub-minute loops)
 const LOOP_MAX_ITERATIONS = 40 // default cap: a loop that never stops ends after this many runs
+// A cap per loop was not a cap: one recorded session chained loops into 99 re-sent prompts over
+// 68 hours and $22.51, the largest single spend anywhere in the system that month. The budget
+// is per session across every loop it starts, and the plugin instance keeps it.
+const LOOP_SESSION_MAX_ITERATIONS = 40
+// Iterations bound turns, not money: a turn that re-reads a long transcript costs many times a
+// short one. The ceiling is measured from the session's own recorded message costs.
+const LOOP_DEFAULT_SPEND_USD = 2
 
 type GoalStatus = "active" | "achieved" | "failed" | "paused"
 
@@ -70,6 +77,10 @@ interface LoopState {
 	/** Iterations dispatched so far (the first run at start counts). */
 	iterations: number
 	maxIterations: number
+	/** Dollar ceiling for this loop, judged against the session's recorded message costs since startedAt. */
+	maxSpendUsd: number
+	/** Spend observed at the last check, for status and notices. */
+	spentUsd: number
 	status: LoopStatus
 	startedAt: number
 	endedAt?: number
@@ -115,11 +126,14 @@ const GOAL_SYSTEM_PROMPT = `Goal (plugin primitive)
 When the user states a completion condition - "keep going until the tests pass", "don't stop until the build is green", or the \`/goal\` command - your FIRST tool call is \`goal_set\` with that condition, before any other work. From then on an evaluator checks the condition after each of your turns and either clears the goal (MET) or hands back guidance and starts another turn automatically. So keep working until the evaluator reports MET: do not stop between turns to ask the user whether to carry on. \`goal_status\` reports the active condition and progress, \`goal_clear\` ends it.
 
 Loop (plugin primitive)
-When the user wants a prompt re-run on a schedule or over and over - "check the deploy every 5 minutes", "keep running this until it passes", or the \`/loop\` command - your FIRST tool call is \`loop\` with the user's words as \`prompt\` (plus \`every\` for a fixed cadence, \`until\` for the stop condition, \`max_iterations\` for the cap), before any other work. Each iteration is dispatched into the session automatically; keep answering the re-run prompt without asking the user between iterations. \`loop_stop\` ends the active loop early; otherwise the loop ends when the \`until\` condition holds or the iteration cap is reached.`
+When the user wants a prompt re-run on a schedule or over and over - "check the deploy every 5 minutes", "keep running this until it passes", or the \`/loop\` command - your FIRST tool call is \`loop\` with the user's words as \`prompt\` (plus \`every\` for a fixed cadence, \`until\` for the stop condition, \`max_iterations\` for the cap, \`max_spend_usd\` for the dollar ceiling), before any other work. \`until\` is required: if the user gave no stopping point, infer one from what they asked for and tell them the wording you used. Each iteration is dispatched into the session automatically; keep answering the re-run prompt without asking the user between iterations. \`loop_stop\` ends the active loop early; otherwise the loop ends when the \`until\` condition holds, the iteration cap is reached, the spend ceiling is reached, or the session's shared budget of ${LOOP_SESSION_MAX_ITERATIONS} loop iterations is used up.`
 
 export const GoalPlugin: Plugin = async ({ client, directory }) => {
 	const goals = new Map<string, GoalState>()
 	const loops = new Map<string, LoopState>()
+	// Loop iterations dispatched per session across every loop it has started, so a new loop
+	// cannot restart the count the previous one exhausted.
+	const loopIterationsUsed = new Map<string, number>()
 	// One pending cadence timer per session with an active loop; dispose() clears them all.
 	const loopTimers = new Map<string, ReturnType<typeof setTimeout>>()
 	const sessionBusy = new Map<string, boolean>()
@@ -383,6 +397,31 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 		return `◎ Loop finished: ${loop.maxIterations} iterations — stopped to avoid burning tokens.\nPrompt: ${loop.prompt}\nStart a new loop or continue manually.`
 	}
 
+	function loopSpendNotice(loop: LoopState): string {
+		return `◎ Loop stopped: it has spent $${loop.spentUsd.toFixed(2)} against a ceiling of $${loop.maxSpendUsd.toFixed(2)} after ${loop.iterations} iteration${loop.iterations === 1 ? "" : "s"}.\nPrompt: ${loop.prompt}\nStart a new loop with a higher max_spend_usd if the work is worth it.`
+	}
+
+	/** Sum the session's recorded assistant message costs since the loop began. */
+	async function loopSpendSince(sessionID: string, startedAt: number): Promise<number> {
+		try {
+			const result = await client.session.messages({ path: { id: sessionID }, query: { directory } })
+			const rows = (result.data ?? []) as Array<{ info: { role: string; cost?: number; time?: { created?: number } } }>
+			let total = 0
+			for (const row of rows) {
+				if (row.info.role !== "assistant") continue
+				if ((row.info.time?.created ?? 0) < startedAt) continue
+				total += row.info.cost ?? 0
+			}
+			return total
+		} catch {
+			return 0
+		}
+	}
+
+	function countLoopIteration(sessionID: string) {
+		loopIterationsUsed.set(sessionID, (loopIterationsUsed.get(sessionID) ?? 0) + 1)
+	}
+
 	async function runLoopIteration(sessionID: string) {
 		const loop = loops.get(sessionID)
 		if (!loop || loop.status !== "active") return
@@ -398,7 +437,13 @@ export const GoalPlugin: Plugin = async ({ client, directory }) => {
 			await endLoop(sessionID, loop, "finished")
 			return
 		}
+		loop.spentUsd = await loopSpendSince(sessionID, loop.startedAt)
+		if (loop.spentUsd >= loop.maxSpendUsd) {
+			await endLoop(sessionID, loop, "finished", loopSpendNotice(loop))
+			return
+		}
 		loop.iterations += 1
+		countLoopIteration(sessionID)
 		const dispatched = await dispatchPrompt(sessionID, loop.prompt)
 		if (!dispatched) {
 			// Session gone: end the loop silently.
@@ -594,17 +639,37 @@ This is the /goal branch for the argument words "clear", "stop", "off", "reset",
 This tool backs the /loop command whenever its arguments are anything other than empty, "status", or a stop word. Call it FIRST, before any other work, passing the user's words as \`prompt\`:
 - prompt: what to do on every iteration (required).
 - every: fixed cadence between iterations, e.g. "5m", "90s", "2h" (minimum one minute). Omit it for self-paced timing: the prompt re-runs five minutes after each turn.
-- until: the stop condition, verifiable from the conversation; the loop ends as soon as the evaluator judges it met.
-- max_iterations: hard cap on iterations (default 40) so an unbounded loop cannot burn tokens.`,
+- until: the stop condition, verifiable from the conversation; the loop ends as soon as the evaluator judges it met. Required — a loop with no stopping point is refused; infer one from the user's words and say which wording you used.
+- max_iterations: hard cap on iterations (default 40) so an unbounded loop cannot burn tokens. A session shares a budget of ${LOOP_SESSION_MAX_ITERATIONS} iterations across every loop it starts.
+- max_spend_usd: dollar ceiling for this loop (default ${LOOP_DEFAULT_SPEND_USD}), judged from the session's recorded message costs before each iteration.`,
 				args: {
 					prompt: tool.schema.string().describe("The prompt re-run on every iteration, taken from the /loop arguments."),
 					every: tool.schema.string().optional().describe("Fixed cadence between iterations, e.g. \"5m\", \"90s\", \"2h\"; minimum 60s. Omit for self-paced timing: five minutes after each turn."),
-					until: tool.schema.string().optional().describe("Optional stop condition, judged by the same evaluator as /goal; the loop stops once it holds."),
-					max_iterations: tool.schema.number().optional().describe("Stop after this many iterations (default 40)."),
+					until: tool.schema.string().optional().describe("Stop condition, judged by the same evaluator as /goal; the loop stops once it holds. Required."),
+					max_iterations: tool.schema.number().optional().describe(`Stop after this many iterations (default 40, and never more than the ${LOOP_SESSION_MAX_ITERATIONS} the session has left across all its loops).`),
+					max_spend_usd: tool.schema.number().optional().describe(`Stop once the session has spent this many dollars since the loop began (default ${LOOP_DEFAULT_SPEND_USD}).`),
 				},
 				async execute(args, context) {
 					if (!args.prompt.trim()) throw new Error("Prompt must not be empty")
+					if (!args.until || !args.until.trim()) {
+						throw new Error(
+							"A loop needs an `until` stop condition. Infer one from what the user asked for — " +
+								"\"watch the deploy\" means \"until the deploy has finished or failed\" — pass it as `until`, " +
+								"and tell the user the wording you chose. A loop with no stopping point ran 99 times in one recorded session.",
+						)
+					}
 					const sessionID = context.sessionID
+					const budgetLeft = LOOP_SESSION_MAX_ITERATIONS - (loopIterationsUsed.get(sessionID) ?? 0)
+					if (budgetLeft <= 0) {
+						throw new Error(
+							`This session has used its budget of ${LOOP_SESSION_MAX_ITERATIONS} loop iterations across the loops it started. ` +
+								"Tell the user plainly; a fresh session starts a fresh budget, and the work the loop was watching is better read from its own status surface than polled by a model.",
+						)
+					}
+					const maxSpendUsd =
+						typeof args.max_spend_usd === "number" && Number.isFinite(args.max_spend_usd) && args.max_spend_usd > 0
+							? args.max_spend_usd
+							: LOOP_DEFAULT_SPEND_USD
 					let intervalMs: number | undefined
 					let clamped = false
 					if (args.every !== undefined && args.every.trim()) {
@@ -615,22 +680,26 @@ This tool backs the /loop command whenever its arguments are anything other than
 						clamped = requested < LOOP_MIN_INTERVAL_MS
 						intervalMs = Math.max(requested, LOOP_MIN_INTERVAL_MS)
 					}
-					const maxIterations =
+					const requestedIterations =
 						typeof args.max_iterations === "number" && Number.isFinite(args.max_iterations) && args.max_iterations >= 1
 							? Math.floor(args.max_iterations)
 							: LOOP_MAX_ITERATIONS
+					const maxIterations = Math.min(requestedIterations, budgetLeft)
 					// One loop per session: replacing one cancels its pending timer first.
 					clearLoopTimer(sessionID)
 					const loop: LoopState = {
 						prompt: args.prompt.slice(0, MAX_CONDITION_CHARS),
-						...(args.until && args.until.trim() ? { until: args.until.slice(0, MAX_CONDITION_CHARS) } : {}),
+						until: args.until.slice(0, MAX_CONDITION_CHARS),
 						...(intervalMs !== undefined ? { intervalMs } : {}),
 						iterations: 1,
 						maxIterations,
+						maxSpendUsd,
+						spentUsd: 0,
 						status: "active",
 						startedAt: Date.now(),
 					}
 					loops.set(sessionID, loop)
+					countLoopIteration(sessionID)
 					// The first iteration runs immediately; later ones follow the cadence.
 					const dispatched = await dispatchPrompt(sessionID, loop.prompt)
 					if (!dispatched) {
@@ -650,13 +719,13 @@ This tool backs the /loop command whenever its arguments are anything other than
 					const lines = [
 						`◎ Loop started (session-scoped). The prompt runs now and re-runs automatically.`,
 						`Prompt: ${loop.prompt}`,
-						`Cadence: ${cadence} · iteration 1 of ${maxIterations}`,
+						`Cadence: ${cadence} · iteration 1 of ${maxIterations}` +
+							(maxIterations < requestedIterations
+								? ` (capped: this session has ${budgetLeft} of its ${LOOP_SESSION_MAX_ITERATIONS} loop iterations left)`
+								: ""),
+						`Stop condition: ${loop.until} — judged by the evaluator after each turn; the loop ends when it holds.`,
+						`Spend ceiling: $${maxSpendUsd.toFixed(2)} of this session's message costs since the loop began.`,
 					]
-					if (loop.until) {
-						lines.push(`Stop condition: ${loop.until} — judged by the evaluator after each turn; the loop ends when it holds.`)
-					} else {
-						lines.push(`No stop condition — the loop ends at ${maxIterations} iterations, or sooner via loop_stop.`)
-					}
 					return lines.join("\n")
 				},
 			}),
