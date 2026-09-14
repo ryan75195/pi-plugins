@@ -48,6 +48,48 @@ const LOG_MAX_BYTES = 512 * 1024
 // keeps working across reboots and across every opencode instance.
 const MACHINE_DIR = join(homedir(), ".config", "opencode", "remote-control")
 const MACHINE_FILE = join(MACHINE_DIR, "machine.json")
+// Remote control the user turned ON for a directory is remembered here, so a
+// process restart resumes it instead of silently stranding a paired phone on a
+// registration that no longer exists.
+const RESUME_FILE = join(MACHINE_DIR, "resume.json")
+
+type ResumeEntry = { name: string; defaultSession: string }
+
+function readResume(directory: string): ResumeEntry | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(RESUME_FILE, "utf8")) as Record<string, ResumeEntry>
+    const entry = raw[directory]
+    return entry && typeof entry.name === "string" && typeof entry.defaultSession === "string"
+      ? entry
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function writeResume(directory: string, entry: ResumeEntry): void {
+  try {
+    mkdirSync(MACHINE_DIR, { recursive: true })
+    const raw = existsSync(RESUME_FILE)
+      ? (JSON.parse(readFileSync(RESUME_FILE, "utf8")) as Record<string, unknown>)
+      : {}
+    raw[directory] = { ...entry, updatedAt: Date.now() }
+    writeFileSync(RESUME_FILE, JSON.stringify(raw, null, 2))
+  } catch {
+    /* resume is best effort */
+  }
+}
+
+function clearResume(directory: string): void {
+  try {
+    if (!existsSync(RESUME_FILE)) return
+    const raw = JSON.parse(readFileSync(RESUME_FILE, "utf8")) as Record<string, unknown>
+    delete raw[directory]
+    writeFileSync(RESUME_FILE, JSON.stringify(raw, null, 2))
+  } catch {
+    /* resume is best effort */
+  }
+}
 const HUB_MOUNT = "/rc-hub"
 const HUB_PORT = 8579 // fixed; instance ports start at 8580, so they never collide
 const HUB_WATCHDOG_MS = 3_000
@@ -1353,6 +1395,7 @@ ${serve.out}`
     updateRegistrations((regs) => [...regs.filter((r) => r.pid !== process.pid), state])
     startHeartbeat()
     startedHere = true
+    writeResume(directory, { name: state.name, defaultSession: sessionID ?? "" })
     // The hub is per machine, not per instance: publish the mount every time
     // (idempotent) and take the port if nobody holds it yet.
     publishHub()
@@ -1365,7 +1408,7 @@ ${serve.out}`
     ].join("\n")
   }
 
-  function stop(): string {
+  function stop(explicit = true): string {
     if (server) {
       server.stop(true)
       server = undefined
@@ -1388,7 +1431,8 @@ ${serve.out}`
     const mount = activeState?.mount
     activeState = undefined
     updateRegistrations((regs) => regs.filter((r) => r.pid !== process.pid))
-    log(`stop mount=${mount ?? "-"}`)
+    if (explicit) clearResume(directory)
+    log(`stop mount=${mount ?? "-"}${explicit ? "" : " (resumable)"}`)
     // Targeted removal of OUR path only. The root is never ours to remove.
     const r =
       mount !== undefined && mount.startsWith("/rc-")
@@ -1397,6 +1441,12 @@ ${serve.out}`
     // The hub mount is shared: it goes away only with the last instance.
     if (liveRegistrations().length === 0) void tailscale(["serve", "--set-path", HUB_MOUNT, "off"])
     return r.ok ? "Remote Control off. Local session unaffected." : `Remote Control off, but tailscale removal failed: ${r.out}`
+  }
+
+  const resume = readResume(directory)
+  if (resume !== undefined && !loadRegistrations().some((r) => r.directory === directory && pidAlive(r.pid))) {
+    log(`resuming remote control for ${directory}`)
+    void start(resume.name, resume.defaultSession)
   }
 
   return {
@@ -1466,7 +1516,7 @@ Report the tool output verbatim — especially the URL and any enable link. Neve
       forwardInstanceEvent(directory, event)
     },
     async dispose() {
-      stop()
+      stop(false)
     },
   }
 }
