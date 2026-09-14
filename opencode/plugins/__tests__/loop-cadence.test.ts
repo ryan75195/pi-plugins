@@ -133,18 +133,18 @@ test("A loop stops once its iteration cap is reached", async () => {
 	}
 })
 
-test("A loop without a stop condition still stops at the default iteration cap", async () => {
+test("A loop whose stop condition never holds still stops at the default iteration cap", async () => {
 	const { plugin, calls } = await makeHarness()
 	mock.timers.enable({ apis: ["setTimeout", "setInterval"] })
 	try {
-		await runTool(plugin, "loop", { prompt: PROMPT, every: "5m" }, "ses-unbounded")
+		await runTool(plugin, "loop", { prompt: PROMPT, every: "5m", until: UNTIL }, "ses-unbounded")
 		mock.timers.tick(1)
 		await settle()
 		for (let i = 0; i < 45; i++) {
 			mock.timers.tick(5 * 60_000)
 			await settle()
 		}
-		assert.equal(runsOf({ plugin, calls }, PROMPT).length, 40, "a loop with no until condition stops at the default cap of 40 iterations")
+		assert.equal(runsOf({ plugin, calls }, PROMPT).length, 40, "a loop whose until never holds stops at the default cap of 40 iterations")
 		mock.timers.tick(60 * 60_000)
 		await settle()
 		assert.equal(runsOf({ plugin, calls }, PROMPT).length, 40, "the capped loop stays stopped")
