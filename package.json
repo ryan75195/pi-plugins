@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "test": "node --test --test-concurrency=1 --test-force-exit \"opencode/plugins/__tests__/*.test.ts\" \"opencode/test/*.test.ts\"",
-    "typecheck": "tsc --noEmit --strict --target esnext --module esnext --moduleResolution bundler --skipLibCheck opencode/plugins/background-tasks.ts opencode/plugins/remote-control.ts extensions/background-tasks/index.ts",
+    "typecheck": "tsc --noEmit --strict --target esnext --module esnext --moduleResolution bundler --skipLibCheck opencode/plugins/background-tasks.ts opencode/plugins/remote-control.ts opencode/plugins/compaction-limit.ts extensions/background-tasks/index.ts",
     "install:opencode": "node scripts/install-opencode.js"
   },
   "devDependencies": {

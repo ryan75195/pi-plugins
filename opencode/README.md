@@ -344,6 +344,37 @@ hosts it; every registered process runs a 3-second watchdog and rebinds if the
 port goes quiet, so the hub survives whichever instance happens to exit. The
 `/rc-hub` tailscale mount is removed only when the last registration goes away.
 
+## compaction-limit (opencode)
+
+Per-session context limit enforcement — `opencode.jsonc`'s `limit.context`
+only fires near the model's declared limit, and some sessions (and the phone
+app, opencode-ios) want a lower one. A watcher living in the app cannot enforce
+it, because iOS suspends the app in the background, so the server enforces it
+instead.
+
+- `opencode/plugins/compaction-limit.ts` — plugin; subscribes to `session.idle`
+  and `session.compacted`, does nothing at startup until an event arrives.
+- The key is `session.metadata.compactionLimit`, a positive integer number of
+  tokens. A client sets it with `PATCH /session/{id}` `{ "metadata": {
+  "compactionLimit": 120000 } }`. A missing key, a non-number, or `0` means
+  "use the server default" — the plugin leaves that session alone entirely.
+- On every `session.idle` for a session that carries a limit, the plugin takes
+  the **latest assistant message** and computes `tokens.input +
+  tokens.cache.read + tokens.cache.write`. If that exceeds the limit, the
+  session is not already compacting (`time.compacting` unset), and this
+  message id has not already been compacted, it calls `POST
+  /session/{id}/summarize` with that message's `providerID`/`modelID` and
+  `auto: true`.
+- It compacts at most once per head: the compacted message id is kept in
+  memory and persisted into `session.metadata.compactionLastHead` (merged via
+  `PATCH`, never replacing the rest of the metadata), so a restarted server
+  does not compact the same head again. `session.compacted` clears the
+  in-memory record for that session. A failed summarize call is logged once
+  for that head and not retried until a later assistant message exceeds the
+  limit.
+- Never edits `title`, never touches a session without the metadata key, and
+  never changes `opencode.jsonc` or any server config.
+
 ## Install (opencode plugins + commands)
 
 ```bash
