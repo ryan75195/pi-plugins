@@ -242,3 +242,41 @@ test("the default export never throws even when called with an unrelated shape",
 		assert.equal(typeof result, "object")
 	})
 })
+
+const FAKE_PLUGIN_INPUT = { client: {} as any, directory: "/work" }
+
+test("readLimit resolves to {} when the loader calls it as a plugin factory", async () => {
+	await assert.doesNotReject(async () => {
+		assert.deepEqual(await (readLimit as any)(FAKE_PLUGIN_INPUT), {})
+	})
+})
+
+test("readLimit resolves to {} when called with a second options argument", async () => {
+	await assert.doesNotReject(async () => {
+		assert.deepEqual(await (readLimit as any)({ compactionLimit: 200_000 }, {}), {})
+	})
+})
+
+test("latestAssistantContext resolves to {} when the loader calls it as a plugin factory", async () => {
+	await assert.doesNotReject(async () => {
+		assert.deepEqual(await (latestAssistantContext as any)(FAKE_PLUGIN_INPUT), {})
+	})
+})
+
+test("latestAssistantContext resolves to {} when called with a second options argument", async () => {
+	await assert.doesNotReject(async () => {
+		assert.deepEqual(await (latestAssistantContext as any)([assistantRow()], {}), {})
+	})
+})
+
+test("decide resolves to {} when the loader calls it as a plugin factory", async () => {
+	await assert.doesNotReject(async () => {
+		assert.deepEqual(await (decide as any)(FAKE_PLUGIN_INPUT), {})
+	})
+})
+
+test("decide resolves to {} when called with a second options argument", async () => {
+	await assert.doesNotReject(async () => {
+		assert.deepEqual(await (decide as any)({ limit: 1, latest: null, compacting: false, lastHead: undefined }, {}), {})
+	})
+})

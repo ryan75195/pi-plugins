@@ -37,7 +37,21 @@ export interface AssistantContext {
 
 export type CompactionDecision = "compact" | "skip"
 
-export function readLimit(metadata: unknown): number | undefined {
+/**
+ * opencode's local-plugin loader does not call only a file's designated `Plugin`
+ * export: for a plain script it invokes every exported function as a plugin
+ * factory, `fn(pluginInput, options)`, then reads hooks off whatever comes back.
+ * `readLimit`/`latestAssistantContext`/`decide` are exported for tests, not as
+ * plugin factories, so a misfired call must return an empty hooks object
+ * instead of running its real logic — the caller can only be the loader.
+ */
+function isPluginLoaderMisfire(first: unknown, rest: unknown[]): boolean {
+	if (rest.length > 0) return true
+	return typeof first === "object" && first !== null && "client" in (first as Record<string, unknown>) && "directory" in (first as Record<string, unknown>)
+}
+
+export function readLimit(metadata: unknown, ...rest: unknown[]): number | undefined {
+	if (isPluginLoaderMisfire(metadata, rest)) return {} as unknown as number | undefined
 	if (typeof metadata !== "object" || metadata === null) return undefined
 	const limit = (metadata as Record<string, unknown>).compactionLimit
 	if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return undefined
@@ -50,7 +64,8 @@ function readLastHead(metadata: unknown): string | undefined {
 	return typeof head === "string" && head.length > 0 ? head : undefined
 }
 
-export function latestAssistantContext(messages: unknown): AssistantContext | null {
+export function latestAssistantContext(messages: unknown, ...rest: unknown[]): AssistantContext | null {
+	if (isPluginLoaderMisfire(messages, rest)) return {} as unknown as AssistantContext | null
 	if (!Array.isArray(messages)) return null
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const info = (messages[i] as { info?: Record<string, unknown> } | undefined)?.info
@@ -71,12 +86,16 @@ export function latestAssistantContext(messages: unknown): AssistantContext | nu
 	return null
 }
 
-export function decide(input: {
-	limit: number | undefined
-	latest: AssistantContext | null
-	compacting: boolean
-	lastHead: string | undefined
-}): CompactionDecision {
+export function decide(
+	input: {
+		limit: number | undefined
+		latest: AssistantContext | null
+		compacting: boolean
+		lastHead: string | undefined
+	},
+	...rest: unknown[]
+): CompactionDecision {
+	if (isPluginLoaderMisfire(input, rest)) return {} as unknown as CompactionDecision
 	if (input.limit === undefined) return "skip"
 	if (!input.latest) return "skip"
 	if (input.compacting) return "skip"
