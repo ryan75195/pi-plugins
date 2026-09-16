@@ -38,6 +38,20 @@ declare const Bun: {
   }): { stop(closeActiveConnections?: boolean): void }
 }
 
+/**
+ * opencode's local-plugin loader does not call only a file's designated `Plugin`
+ * export: for a plain script it invokes every exported function as a plugin
+ * factory, `fn(pluginInput, options)`, then reads hooks off whatever comes back.
+ * `updateRegistrations`, `makeInstanceRouteHandler`, `openInstanceEventStream` and
+ * `forwardInstanceEvent` are exported for reuse/tests, not as plugin factories, so
+ * a misfired call must return an empty hooks object instead of running its real
+ * logic — the caller can only be the loader.
+ */
+function isPluginLoaderMisfire(first: unknown, rest: unknown[]): boolean {
+  if (rest.length > 0) return true
+  return typeof first === "object" && first !== null && "client" in (first as Record<string, unknown>) && "directory" in (first as Record<string, unknown>)
+}
+
 const STATE_DIR = join(process.env.TEMP ?? "/tmp", "opencode-remote")
 const STATE_FILE = join(STATE_DIR, "state.json")
 // Append-only diagnostics: every tailscale call and every registration
@@ -303,7 +317,8 @@ function pruneDeadRegistrations(regs: RemoteState[]): RemoteState[] {
   return regs.filter((r) => r.pid === process.pid || pidAlive(r.pid))
 }
 
-function updateRegistrations(mutate: (regs: RemoteState[]) => RemoteState[]): void {
+function updateRegistrations(mutate: (regs: RemoteState[]) => RemoteState[], ...rest: unknown[]): void {
+  if (isPluginLoaderMisfire(mutate, rest)) return {} as unknown as void
   withStateLock(() => {
     persistRegistrations(pruneDeadRegistrations(mutate(loadRegistrations())))
   })
@@ -636,7 +651,11 @@ export type InstanceRouteDeps = {
   disconnect: () => void
 }
 
-export function makeInstanceRouteHandler(deps: InstanceRouteDeps): (req: Request) => Promise<Response> {
+export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unknown[]): (req: Request) => Promise<Response> {
+  // deps legitimately carries client and directory (it needs them for the routes it
+  // builds), so the shared shape check used elsewhere would false-positive here — this
+  // export only ever takes one argument for real, so a second one is the loader misfire.
+  if (rest.length > 0) return {} as unknown as (req: Request) => Promise<Response>
   const { client, directory, token: tok, getState, listSessions, messagesOf, questionProxy, disconnect } = deps
 
   const sdk = async (
@@ -890,7 +909,8 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps): (req: Request
  * so the app threw on every frame and reconnected forever — nothing streamed.
  * Every event type is forwarded untouched; filtering belongs to the client.
  */
-export function openInstanceEventStream(directory: string): Response {
+export function openInstanceEventStream(directory: string, ...rest: unknown[]): Response {
+  if (isPluginLoaderMisfire(directory, rest)) return {} as unknown as Response
   const encoder = new TextEncoder()
   let closed = false
   let keepalive: ReturnType<typeof setInterval> | undefined
@@ -953,7 +973,11 @@ export function openInstanceEventStream(directory: string): Response {
   })
 }
 
-export function forwardInstanceEvent(directory: string, event: RemoteControlEvent): void {
+export function forwardInstanceEvent(directory: string, event: RemoteControlEvent, ...rest: unknown[]): void {
+  // The loader's malformed call also passes exactly two arguments (pluginInput,
+  // options), so a third argument never distinguishes it here — only the shape of
+  // `directory` does: a real caller always passes a string, the loader a PluginInput.
+  if (isPluginLoaderMisfire(directory, rest)) return {} as unknown as void
   // Live /event subscribers get the event untouched inside the { directory,
   // payload } wrapper native clients already parse; filtering is the client's
   // job. Sinks are per directory, so one process never cross-posts another
