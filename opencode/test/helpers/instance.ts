@@ -1,13 +1,13 @@
 import { mkdirSync, mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createFakeOpencode, type FakeMessageRow } from "./fakeOpencode.ts"
+import { createFakeOpencode, type FakeMessage } from "./fakeOpencode.ts"
 
 type RemoteControlModule = typeof import("../../plugins/remote-control.ts")
 
 let modulePromise: Promise<RemoteControlModule> | undefined
 
-async function loadModule(): Promise<RemoteControlModule> {
+export async function loadModule(): Promise<RemoteControlModule> {
   if (!modulePromise) {
     const sandbox = mkdtempSync(join(tmpdir(), "remote-control-contract-"))
     process.env.TEMP = sandbox
@@ -25,12 +25,18 @@ export type TestInstance = {
   token: string
   fake: ReturnType<typeof createFakeOpencode>
   request: (method: string, path: string, options?: CallOptions) => Promise<Response>
+  close: () => Promise<void>
 }
 
+/**
+ * Boots the plugin's V2 `setup` against a fake plugin context (so its tool,
+ * hooks and event subscription are live) and serves the instance routes from
+ * the same fake, without the tailscale "on" path.
+ */
 export async function openTestInstance(
   seed: {
     sessions?: Array<{ id: string; title: string }>
-    messages?: Record<string, FakeMessageRow[]>
+    messages?: Record<string, FakeMessage[]>
   } = {},
   options: { disconnect?: () => void } = {},
 ): Promise<TestInstance> {
@@ -38,34 +44,17 @@ export async function openTestInstance(
   const directory = `/work/contract-${Math.random().toString(36).slice(2, 8)}`
   const token = `inst-${Math.random().toString(36).slice(2, 12)}`
   const fake = createFakeOpencode({ directory, sessions: seed.sessions, messages: seed.messages })
-  const hooks = await mod.RemoteControlPlugin({
-    client: fake.client,
-    project: { id: "contract" },
-    directory,
-    worktree: directory,
-    experimental_workspace: { register: () => {} },
-    serverUrl: new URL("http://127.0.0.1:9"),
-    $: {},
-  } as unknown as Parameters<typeof mod.RemoteControlPlugin>[0])
-  fake.onSessionEvent((event) => {
-    void hooks.event?.({ event: event as never })
-  })
+  const cleanup = await mod.default.setup(fake.ctx as unknown as Parameters<RemoteControlModule["default"]["setup"]>[0])
   const handle = mod.makeInstanceRouteHandler({
-    client: fake.client,
+    api: fake.ctx as unknown as Parameters<RemoteControlModule["makeInstanceRouteHandler"]>[0]["api"],
     directory,
     token,
     getState: () => undefined,
-    listSessions: async () => {
-      throw new Error("the web-page /api/* surface is outside this contract")
+    questionProxy: async () => {
+      throw new Error("question routes are outside this contract")
     },
-    messagesOf: async () => {
-      throw new Error("the web-page /api/* surface is outside this contract")
-    },
-      questionProxy: async () => {
-        throw new Error("question routes are outside this contract")
-      },
-      disconnect: options.disconnect ?? (() => {}),
-    })
+    disconnect: options.disconnect ?? (() => {}),
+  })
   const request = async (method: string, path: string, options: CallOptions = {}): Promise<Response> => {
     const headers: Record<string, string> = {}
     if (options.token !== null) headers["x-oc-token"] = options.token ?? token
@@ -76,5 +65,13 @@ export async function openTestInstance(
     }
     return handle(new Request(`http://instance.test${path}`, init))
   }
-  return { directory, token, fake, request }
+  return {
+    directory,
+    token,
+    fake,
+    request,
+    close: async () => {
+      if (typeof cleanup === "function") await cleanup()
+    },
+  }
 }

@@ -68,13 +68,14 @@ test("a listener subscribed to the event stream is told about the deletion witho
       directory: instance.directory,
       payload: {
         type: "session.deleted",
-        properties: { info: { id: "ses_mobile_lingering", title: "📱 New session" } },
+        // opencode 2 sends only the id; V1's `info` is rebuilt around it.
+        properties: { sessionID: "ses_mobile_lingering", info: { id: "ses_mobile_lingering" } },
       },
     })
 
     assert.deepEqual(
       instance.fake.callNames(),
-      ["session.delete"],
+      ["session.remove"],
       "the listener must learn of the deletion from the pushed event, not by re-listing sessions",
     )
   } finally {
