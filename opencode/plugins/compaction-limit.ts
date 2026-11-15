@@ -1,26 +1,23 @@
 /**
- * compaction-limit — opencode plugin
+ * compaction-limit — opencode plugin (opencode 2.3.0 / V2 plugin API)
  *
  * Enforces a per-session context limit read from `session.metadata.compactionLimit`.
  * The app (opencode-ios) writes that key and shows the state; this plugin does the
  * enforcing, because a phone-side watcher cannot act while iOS suspends the app.
  *
- * On every `session.idle` event, for a session that carries a positive
- * `compactionLimit`, the plugin looks at the latest assistant message's
- * `tokens.input + tokens.cache.read + tokens.cache.write`. If that exceeds the
- * limit, the session is not already compacting, and this message id has not
- * already been compacted, it calls `POST /session/{id}/summarize` with that
- * message's `providerID`/`modelID` and `auto: true`, then persists the
- * compacted message id into `session.metadata.compactionLastHead` (merged via
- * PATCH) so a restarted server does not compact the same head again.
- * `session.compacted` clears the in-memory head for that session.
- *
- * The vendored `@opencode-ai/sdk` typings lag the running server: they have no
- * `metadata` on `Session` and no `auto` on the summarize body. Fields the SDK
- * doesn't know about are still sent, cast at the call site, the way
- * remote-control.ts already does for endpoints the SDK lags on.
+ * When a session finishes model work and is about to go idle (the
+ * `experimental.idle` session hook — V2 has no `session.idle` plugin event), for a
+ * session that carries a positive `compactionLimit`, the plugin looks at the
+ * latest assistant message's `tokens.input + tokens.cache.read + tokens.cache.write`.
+ * If that exceeds the limit, the session is not already compacting, and this
+ * message id has not already been compacted, it calls `session.compact` (V2 always
+ * compacts with the session's own model and takes no `auto` flag), then persists
+ * the compacted message id into `session.metadata.compactionLastHead` (merged with
+ * the existing metadata) so a restarted server does not compact the same head again.
+ * `session.compaction.ended` (the V2 successor of `session.compacted`) clears the
+ * in-memory head for that session.
  */
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { appendFile, mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -37,21 +34,9 @@ export interface AssistantContext {
 
 export type CompactionDecision = "compact" | "skip"
 
-/**
- * opencode's local-plugin loader does not call only a file's designated `Plugin`
- * export: for a plain script it invokes every exported function as a plugin
- * factory, `fn(pluginInput, options)`, then reads hooks off whatever comes back.
- * `readLimit`/`latestAssistantContext`/`decide` are exported for tests, not as
- * plugin factories, so a misfired call must return an empty hooks object
- * instead of running its real logic — the caller can only be the loader.
- */
-function isPluginLoaderMisfire(first: unknown, rest: unknown[]): boolean {
-	if (rest.length > 0) return true
-	return typeof first === "object" && first !== null && "client" in (first as Record<string, unknown>) && "directory" in (first as Record<string, unknown>)
-}
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
-export function readLimit(metadata: unknown, ...rest: unknown[]): number | undefined {
-	if (isPluginLoaderMisfire(metadata, rest)) return {} as unknown as number | undefined
+export function readLimit(metadata: unknown): number | undefined {
 	if (typeof metadata !== "object" || metadata === null) return undefined
 	const limit = (metadata as Record<string, unknown>).compactionLimit
 	if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return undefined
@@ -64,18 +49,22 @@ function readLastHead(metadata: unknown): string | undefined {
 	return typeof head === "string" && head.length > 0 ? head : undefined
 }
 
-export function latestAssistantContext(messages: unknown, ...rest: unknown[]): AssistantContext | null {
-	if (isPluginLoaderMisfire(messages, rest)) return {} as unknown as AssistantContext | null
+/**
+ * V2 messages are flat (`{ id, type: "assistant", model: { id, providerID }, tokens }`)
+ * instead of V1's `{ info: { id, role, providerID, modelID, tokens } }`.
+ */
+export function latestAssistantContext(messages: unknown): AssistantContext | null {
 	if (!Array.isArray(messages)) return null
 	for (let i = messages.length - 1; i >= 0; i--) {
-		const info = (messages[i] as { info?: Record<string, unknown> } | undefined)?.info
-		if (!info || info.role !== "assistant") continue
-		const { id, providerID, modelID, tokens } = info as {
+		const msg = messages[i] as Record<string, unknown> | undefined
+		if (!msg || msg.type !== "assistant") continue
+		const { id, model, tokens } = msg as {
 			id?: unknown
-			providerID?: unknown
-			modelID?: unknown
+			model?: { id?: unknown; providerID?: unknown }
 			tokens?: { input?: unknown; cache?: { read?: unknown; write?: unknown } }
 		}
+		const providerID = model?.providerID
+		const modelID = model?.id
 		if (typeof id !== "string" || typeof providerID !== "string" || typeof modelID !== "string") continue
 		if (typeof tokens !== "object" || tokens === null) continue
 		const input = typeof tokens.input === "number" ? tokens.input : 0
@@ -86,16 +75,21 @@ export function latestAssistantContext(messages: unknown, ...rest: unknown[]): A
 	return null
 }
 
-export function decide(
-	input: {
-		limit: number | undefined
-		latest: AssistantContext | null
-		compacting: boolean
-		lastHead: string | undefined
-	},
-	...rest: unknown[]
-): CompactionDecision {
-	if (isPluginLoaderMisfire(input, rest)) return {} as unknown as CompactionDecision
+/** V2 has no `session.time.compacting`: a compaction still running shows as a `compaction` message with status "running". */
+function hasRunningCompaction(messages: unknown): boolean {
+	if (!Array.isArray(messages)) return false
+	return messages.some((m) => {
+		const msg = m as Record<string, unknown> | undefined
+		return msg?.type === "compaction" && msg.status === "running"
+	})
+}
+
+export function decide(input: {
+	limit: number | undefined
+	latest: AssistantContext | null
+	compacting: boolean
+	lastHead: string | undefined
+}): CompactionDecision {
 	if (input.limit === undefined) return "skip"
 	if (!input.latest) return "skip"
 	if (input.compacting) return "skip"
@@ -116,71 +110,73 @@ async function logFailure(sessionID: string, head: string, err: unknown): Promis
 	}
 }
 
-export const CompactionLimit: Plugin = async ({ client, directory }) => {
-	const lastHeadBySession = new Map<string, string>()
-	const pending = new Set<string>()
+export default Plugin.define({
+	id: "compaction-limit",
+	async setup(ctx) {
+		const lastHeadBySession = new Map<string, string>()
+		const compactingSessions = new Set<string>()
+		const pending = new Set<string>()
 
-	async function handleIdle(sessionID: string): Promise<void> {
-		if (pending.has(sessionID)) return
-		pending.add(sessionID)
-		try {
-			const sessionResult = await client.session.get({ path: { id: sessionID }, query: { directory } })
-			const session = sessionResult.data as
-				| { metadata?: unknown; time?: { compacting?: number } }
-				| undefined
-			if (!session) return
-			const limit = readLimit(session.metadata)
-			if (limit === undefined) return
-
-			const messagesResult = await client.session.messages({ path: { id: sessionID }, query: { directory } })
-			const latest = latestAssistantContext(messagesResult.data)
-			const compacting = session.time?.compacting !== undefined
-			const lastHead = lastHeadBySession.get(sessionID) ?? readLastHead(session.metadata)
-
-			if (decide({ limit, latest, compacting, lastHead }) !== "compact" || !latest) return
-
-			lastHeadBySession.set(sessionID, latest.messageID)
+		async function handleIdle(sessionID: string): Promise<void> {
+			if (pending.has(sessionID)) return
+			pending.add(sessionID)
 			try {
-				await client.session.summarize({
-					path: { id: sessionID },
-					body: { providerID: latest.providerID, modelID: latest.modelID, auto: true } as never,
-					query: { directory },
-				})
-				const metadata = typeof session.metadata === "object" && session.metadata !== null ? session.metadata : {}
-				await client.session.update({
-					path: { id: sessionID },
-					body: { metadata: { ...metadata, compactionLastHead: latest.messageID } } as never,
-					query: { directory },
-				})
+				const session = await ctx.session.get({ sessionID })
+				if (!session) return
+				const limit = readLimit(session.metadata)
+				if (limit === undefined) return
+
+				const messages = await ctx.session.context({ sessionID })
+				const latest = latestAssistantContext(messages)
+				const compacting = compactingSessions.has(sessionID) || hasRunningCompaction(messages)
+				const lastHead = lastHeadBySession.get(sessionID) ?? readLastHead(session.metadata)
+
+				if (decide({ limit, latest, compacting, lastHead }) !== "compact" || !latest) return
+
+				lastHeadBySession.set(sessionID, latest.messageID)
+				try {
+					await ctx.session.compact({ sessionID })
+					const metadata: Record<string, JsonValue> =
+						typeof session.metadata === "object" && session.metadata !== null ? session.metadata : {}
+					await ctx.session.update({
+						sessionID,
+						metadata: { ...metadata, compactionLastHead: latest.messageID },
+					})
+				} catch (err) {
+					void logFailure(sessionID, latest.messageID, err)
+				}
 			} catch (err) {
-				void logFailure(sessionID, latest.messageID, err)
+				void logFailure(sessionID, "unknown", err)
+			} finally {
+				pending.delete(sessionID)
 			}
-		} catch (err) {
-			void logFailure(sessionID, "unknown", err)
-		} finally {
-			pending.delete(sessionID)
 		}
-	}
 
-	return {
-		event: async ({ event }) => {
-			if (event.type === "session.idle") {
-				void handleIdle(event.properties.sessionID)
-				return
+		await ctx.session.hook("experimental.idle", (input) => {
+			void handleIdle(input.sessionID)
+		})
+
+		const abort = new AbortController()
+		void (async () => {
+			try {
+				for await (const event of ctx.event.subscribe({
+					types: ["session.compaction.started", "session.compaction.ended", "session.compaction.failed"],
+					signal: abort.signal,
+				})) {
+					if (event.type === "session.compaction.started") {
+						compactingSessions.add(event.data.sessionID)
+					} else if (event.type === "session.compaction.ended") {
+						compactingSessions.delete(event.data.sessionID)
+						lastHeadBySession.delete(event.data.sessionID)
+					} else if (event.type === "session.compaction.failed") {
+						compactingSessions.delete(event.data.sessionID)
+					}
+				}
+			} catch (err) {
+				if (!abort.signal.aborted) void logFailure("-", "event-stream", err)
 			}
-			if (event.type === "session.compacted") {
-				lastHeadBySession.delete(event.properties.sessionID)
-			}
-		},
-	}
-}
+		})()
 
-const compactionLimitEntry: Plugin = async (input, options) => {
-	try {
-		return await CompactionLimit(input, options)
-	} catch {
-		return {}
-	}
-}
-
-export default compactionLimitEntry
+		return () => abort.abort()
+	},
+})
