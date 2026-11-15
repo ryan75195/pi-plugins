@@ -16,10 +16,17 @@
  * plugin inside the opencode server process (Bun.serve). Nothing is exposed to
  * the public internet (that would be `funnel`), and the endpoint is token
  * gated on top of tailnet scoping.
+ *
+ * Built against the opencode 2.3 (V2) plugin API: a default export `{ id, setup }`
+ * whose `setup(ctx)` registers the tool, the system-prompt hook and the event
+ * subscription. The REST surface the phone/web clients speak is still the V1
+ * one: V2 sessions, messages and events are mapped to the V1 shapes at the API
+ * boundary (see "V2 -> V1 shapes" below), so the clients stay unchanged.
  */
-import type { Plugin } from "@opencode-ai/plugin"
-import type { FilePartInput, TextPartInput } from "@opencode-ai/sdk"
-import { tool } from "@opencode-ai/plugin"
+// Type-only: the runtime value `Plugin.define` is the identity function, so a plain
+// `{ id, setup }` object is the same thing and the file stays loadable outside opencode
+// (the contract tests import it under plain Node).
+import type { Plugin } from "@opencode/plugin"
 import { createHash, randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
@@ -137,6 +144,345 @@ type MessageRow = {
   parts: Array<{ type: string; text?: string; tool?: string; state?: { status?: string; output?: string } }>
 }
 type PromptModel = { providerID: string; modelID: string }
+// The V1 prompt-part shapes the REST clients send (V1 @opencode-ai/sdk TextPartInput /
+// FilePartInput, reduced to the fields this plugin forwards).
+type TextPartInput = { type: "text"; text: string }
+type FilePartInput = { type: "file"; mime: string; url: string; filename?: string }
+
+/** The slice of the V2 plugin context the REST surface drives. */
+export type RemoteControlApi = Pick<Plugin.Context, "session" | "agent" | "command" | "provider" | "model" | "permission">
+
+// ── V2 -> V1 shapes ─────────────────────────────────────────────────────────
+// opencode 2.x reshaped sessions, messages and events. The phone app and the
+// web page speak the V1 REST shapes, so everything is mapped here, at the API
+// boundary, and the clients stay unchanged. Inputs are read defensively: they
+// come from the host, but a shape drift must cost a field, not a 500.
+
+type Loose = Record<string, unknown>
+const asLoose = (value: unknown): Loose => (typeof value === "object" && value !== null ? (value as Loose) : {})
+const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined)
+const num = (value: unknown): number | undefined => (typeof value === "number" && Number.isFinite(value) ? value : undefined)
+
+export type V1Session = {
+  id: string
+  projectID: string
+  directory: string
+  parentID?: string
+  title: string
+  version: string
+  time: { created: number; updated: number; archived?: number }
+}
+
+export function toV1Session(raw: unknown, directory: string): V1Session {
+  const s = asLoose(raw)
+  const time = asLoose(s.time)
+  const created = num(time.created) ?? 0
+  const archived = num(time.archived)
+  const parentID = str(s.parentID)
+  return {
+    id: String(s.id),
+    projectID: str(s.projectID) ?? "",
+    directory,
+    ...(parentID ? { parentID } : {}),
+    title: str(s.title) ?? "",
+    version: "2",
+    time: { created, updated: num(time.updated) ?? created, ...(archived !== undefined ? { archived } : {}) },
+  }
+}
+
+export type V1Part = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: string
+  text?: string
+  synthetic?: boolean
+  tool?: string
+  callID?: string
+  mime?: string
+  url?: string
+  filename?: string
+  state?: { status: string; input?: unknown; output?: string; error?: string }
+}
+export type V1MessageRow = {
+  info: {
+    id: string
+    sessionID: string
+    role: "user" | "assistant"
+    time: { created: number; completed?: number }
+    agent?: string
+    mode?: string
+    modelID?: string
+    providerID?: string
+  }
+  parts: V1Part[]
+}
+
+const TOOL_STATUS: Record<string, string> = { streaming: "pending", running: "running", completed: "completed", error: "error" }
+
+function toolOutput(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  const texts = content.map(asLoose).filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text as string)
+  return texts.length > 0 ? texts.join("\n") : undefined
+}
+
+/**
+ * One V2 SessionMessage as a V1 `{ info, parts }` row, or undefined for the V2
+ * bookkeeping entries V1 never had (agent/model/location switches, idle markers,
+ * compaction records, system notes, skill loads).
+ */
+export function toV1Message(raw: unknown, sessionID: string): V1MessageRow | undefined {
+  const m = asLoose(raw)
+  const id = String(m.id ?? "")
+  const time = asLoose(m.time)
+  const created = num(time.created) ?? 0
+  const completed = num(time.completed)
+  const part = (index: number, rest: Omit<V1Part, "id" | "sessionID" | "messageID">): V1Part => ({
+    id: `${id}-p${index}`,
+    sessionID,
+    messageID: id,
+    ...rest,
+  })
+  if (m.type === "user" || m.type === "synthetic") {
+    const parts: V1Part[] = []
+    const text = str(m.text)
+    if (text) parts.push(part(0, { type: "text", text, ...(m.type === "synthetic" ? { synthetic: true } : {}) }))
+    for (const f of Array.isArray(m.files) ? m.files.map(asLoose) : []) {
+      const mime = str(f.mime) ?? "application/octet-stream"
+      const data = str(f.data)
+      const source = asLoose(f.source)
+      const url = str(source.uri) ?? (data !== undefined ? `data:${mime};base64,${data}` : "")
+      parts.push(part(parts.length, { type: "file", mime, url, ...(str(f.name) ? { filename: str(f.name) } : {}) }))
+    }
+    return { info: { id, sessionID, role: "user", time: { created } }, parts }
+  }
+  if (m.type === "assistant") {
+    const model = asLoose(m.model)
+    const agent = str(m.agent)
+    const parts: V1Part[] = []
+    for (const c of Array.isArray(m.content) ? m.content.map(asLoose) : []) {
+      if ((c.type === "text" || c.type === "reasoning") && typeof c.text === "string") {
+        parts.push(part(parts.length, { type: c.type, text: c.text }))
+      } else if (c.type === "tool") {
+        const state = asLoose(c.state)
+        const status = TOOL_STATUS[String(state.status)] ?? String(state.status ?? "pending")
+        const output = toolOutput(state.content)
+        const error = str(asLoose(state.error).message)
+        parts.push(
+          part(parts.length, {
+            type: "tool",
+            callID: str(c.id) ?? "",
+            tool: str(c.name) ?? "",
+            state: { status, input: state.input ?? {}, ...(output !== undefined ? { output } : {}), ...(error ? { error } : {}) },
+          }),
+        )
+      }
+    }
+    return {
+      info: {
+        id,
+        sessionID,
+        role: "assistant",
+        time: { created, ...(completed !== undefined ? { completed } : {}) },
+        ...(agent ? { agent, mode: agent } : {}),
+        ...(str(model.id) ? { modelID: str(model.id), providerID: str(model.providerID) } : {}),
+      },
+      parts,
+    }
+  }
+  if (m.type === "shell") {
+    // V1 recorded a `!command` as a bash tool call; V2 keeps it as its own entry.
+    const status = m.status === "running" ? "running" : "completed"
+    const output = str(asLoose(m.output).output)
+    return {
+      info: { id, sessionID, role: "assistant", time: { created, ...(completed !== undefined ? { completed } : {}) } },
+      parts: [
+        part(0, {
+          type: "tool",
+          callID: id,
+          tool: "bash",
+          state: { status, input: { command: str(m.command) ?? "" }, ...(output !== undefined ? { output } : {}) },
+        }),
+      ],
+    }
+  }
+  return undefined
+}
+
+/** A V2 event `{ id, created, type, data, location? }` as the V1 `{ type, properties }`. */
+export function toV1Event(raw: unknown): RemoteControlEvent {
+  const e = asLoose(raw)
+  const type = String(e.type ?? "")
+  const properties = asLoose(e.data ?? e.properties)
+  // V1's session.deleted carried the session as `info`; V2 sends only its id.
+  // Clients key the removal on `info.id`, so that much is rebuilt.
+  if (type === "session.deleted" && typeof properties.sessionID === "string" && properties.info === undefined) {
+    return { type, properties: { ...properties, info: { id: properties.sessionID } } }
+  }
+  return { type, properties }
+}
+
+/**
+ * HTTP status for a failed host call. The in-process API rejects with tagged
+ * errors (`…NotFound…`, schema/decode failures) or errors carrying a status;
+ * anything else is a 500, like an upstream failure under V1.
+ */
+function errorStatus(error: unknown): number {
+  let current: unknown = error
+  for (let depth = 0; depth < 5 && typeof current === "object" && current !== null; depth++) {
+    const e = current as Loose
+    const status = num(e.status) ?? num(asLoose(e.response).status)
+    if (status !== undefined && status >= 400 && status < 600) return status
+    const tag = `${str(e._tag) ?? ""} ${str(e.name) ?? ""}`
+    if (/NotFound/i.test(tag)) return 404
+    if (/BadRequest|Schema|Parse|Decode|Invalid/i.test(tag)) return 400
+    current = e.cause ?? e.error
+  }
+  return 500
+}
+
+function errorBody(error: unknown): { name: string; data: { message: string } } {
+  const e = asLoose(error)
+  const name = str(e._tag) ?? str(e.name) ?? "UnknownError"
+  const message = str(e.message) ?? String(error)
+  return { name, data: { message } }
+}
+
+/** A V1-ish error response: the upstream error with its own status, never a bare "not found". */
+function failure(error: unknown): Response {
+  return json(errorBody(error), errorStatus(error))
+}
+
+/** V1 prompt parts as the V2 prompt input: one text plus file attachments. */
+function toPromptInput(parts: Array<TextPartInput | FilePartInput>): { text: string; files?: Array<{ uri: string; name?: string }> } {
+  const text = parts
+    .filter((p): p is TextPartInput => p.type === "text")
+    .map((p) => p.text)
+    .join("\n\n")
+  const files = parts
+    .filter((p): p is FilePartInput => p.type === "file")
+    .map((p) => ({ uri: p.url, ...(p.filename ? { name: p.filename } : {}) }))
+  return { text, ...(files.length > 0 ? { files } : {}) }
+}
+
+/**
+ * V1 prompts and commands carried a per-request model and agent. V2 selects
+ * them on the session instead, so a selector is applied as a switch before the
+ * request — it then also stays the session's selection, as the last-used model
+ * and agent did under V1.
+ */
+async function applySelection(api: RemoteControlApi, sessionID: string, model?: PromptModel, agent?: string): Promise<void> {
+  if (agent) await api.session.switchAgent({ sessionID, agent })
+  if (model) await api.session.switchModel({ sessionID, model: { id: model.modelID, providerID: model.providerID } })
+}
+
+/** Every session of this directory, newest first, following the V2 cursor. */
+async function listV2Sessions(api: RemoteControlApi, directory: string): Promise<unknown[]> {
+  const rows: unknown[] = []
+  let cursor: string | undefined
+  for (let page = 0; page < 20; page++) {
+    const res = await api.session.list({ directory, ...(cursor ? { cursor } : {}) })
+    rows.push(...(res.data ?? []))
+    const next = res.cursor?.next
+    if (typeof next !== "string" || next.length === 0 || next === cursor) break
+    cursor = next
+  }
+  return rows
+}
+
+/**
+ * The session's messages in V1 rows. V2 gives a plugin the session's model
+ * context (`session.context`), not the full stored history, so a compacted
+ * session shows what the model currently sees (from the compaction on).
+ */
+async function v1Messages(api: RemoteControlApi, sessionID: string): Promise<V1MessageRow[]> {
+  const rows = await api.session.context({ sessionID })
+  const out: V1MessageRow[] = []
+  for (const row of rows ?? []) {
+    const mapped = toV1Message(row, sessionID)
+    if (mapped) out.push(mapped)
+  }
+  return out
+}
+
+/** The web page's session list: id, title and last update, newest first. */
+async function webSessions(api: RemoteControlApi, directory: string): Promise<SessionRow[]> {
+  const rows = (await listV2Sessions(api, directory)).map((s) => toV1Session(s, directory))
+  return rows
+    .map((s) => ({ id: s.id, title: s.title ?? "", updatedAt: s.time.updated }))
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+}
+
+/** The web page's transcript: one { role, text } per message, tool calls as "[tool status]". */
+async function webMessages(api: RemoteControlApi, sid: string): Promise<Array<{ role: string; text: string }>> {
+  const rows: MessageRow[] = await v1Messages(api, sid)
+  const out: Array<{ role: string; text: string }> = []
+  for (const row of rows) {
+    const chunks: string[] = []
+    for (const part of row.parts ?? []) {
+      if (part.type === "text" && part.text) chunks.push(part.text)
+      else if (part.type === "tool" && part.tool) chunks.push(`[${part.tool}${part.state?.status ? " " + part.state.status : ""}]`)
+    }
+    const text = chunks.join("\n").trim()
+    if (text) out.push({ role: row.info?.role ?? "assistant", text })
+  }
+  return out
+}
+
+/** V1 `config.providers`: connected providers, each with its `models` map, plus a per-provider `default`. */
+async function v1Providers(api: RemoteControlApi, directory: string): Promise<{ providers: unknown[]; default: Record<string, string> }> {
+  const location = { location: { directory } }
+  const [providers, models, fallback] = await Promise.all([
+    api.provider.list(location),
+    api.model.list(location),
+    api.model.default(location).catch(() => undefined),
+  ])
+  const byProvider = new Map<string, Loose[]>()
+  for (const m of (models.data ?? []).map(asLoose)) {
+    if (m.enabled === false) continue
+    const providerID = String(m.providerID)
+    byProvider.set(providerID, [...(byProvider.get(providerID) ?? []), m])
+  }
+  const defaultModel = asLoose(fallback?.data)
+  const out: unknown[] = []
+  const defaults: Record<string, string> = {}
+  for (const p of (providers.data ?? []).map(asLoose)) {
+    const id = String(p.id)
+    const list = byProvider.get(id)
+    if (!list || list.length === 0) continue
+    const entries = list.map((m) => {
+      const modelID = String(m.id)
+      return [modelID, { ...m, id: modelID, providerID: id, name: str(m.name) ?? modelID }] as const
+    })
+    out.push({ ...p, id, name: str(p.name) ?? id, models: Object.fromEntries(entries) })
+    defaults[id] = defaultModel.providerID === id && typeof defaultModel.id === "string" ? defaultModel.id : entries[0]![0]
+  }
+  return { providers: out, default: defaults }
+}
+
+/** V1 agents were addressed by `name`; in V2 that is the agent `id` (`name` is its display name). */
+async function v1Agents(api: RemoteControlApi, directory: string): Promise<unknown[]> {
+  const res = await api.agent.list({ location: { directory } })
+  return (res.data ?? []).map((raw) => {
+    const a = asLoose(raw)
+    const model = asLoose(a.model)
+    return {
+      ...a,
+      name: String(a.id ?? a.name),
+      displayName: str(a.name),
+      ...(str(model.id) ? { model: { providerID: str(model.providerID), modelID: str(model.id) } } : { model: undefined }),
+    }
+  })
+}
+
+/** V1 commands carried their `template`; V2 lists only name and description. */
+async function v1Commands(api: RemoteControlApi, directory: string): Promise<unknown[]> {
+  const res = await api.command.list({ location: { directory } })
+  return (res.data ?? []).map((raw) => {
+    const c = asLoose(raw)
+    return { name: String(c.name), description: str(c.description) ?? "", template: "" }
+  })
+}
 
 /**
  * Model and agent selectors arrive from an untrusted client, and both are
@@ -228,7 +574,7 @@ let eventLog: Array<{ type: string; sessionID?: string }> = []
 const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>()
 type NativeStreamSink = { write: (chunk: string) => boolean }
 // Phone / native clients on GET /event, keyed by instance directory and fed by
-// the plugin event hook (forwardInstanceEvent).
+// the plugin's event subscription (forwardInstanceEvent).
 const nativeStreamSinks = new Map<string, Set<NativeStreamSink>>()
 // Live /event subscribers, counted so a leaked subscription shows up in the log
 // rather than only as quietly growing memory.
@@ -636,34 +982,43 @@ function authorizedInstance(req: Request, tok: string): boolean {
   return authorized(req, tok, pairingConfig().pairingToken)
 }
 
-export type RemoteControlSdkClient = Parameters<Plugin>[0]["client"]
-
 export type RemoteControlEvent = { type: string; properties?: unknown }
 
 export type InstanceRouteDeps = {
-  client: RemoteControlSdkClient
+  api: RemoteControlApi
   directory: string
   token: string
   getState: () => RemoteState | undefined
-  listSessions: () => Promise<SessionRow[]>
-  messagesOf: (sessionID: string) => Promise<Array<{ role: string; text: string }>>
+  /** The web page's /api/sessions; defaults to the session list read through `api`. */
+  listSessions?: () => Promise<SessionRow[]>
+  /** The web page's /api/messages; defaults to the transcript read through `api`. */
+  messagesOf?: (sessionID: string) => Promise<Array<{ role: string; text: string }>>
   questionProxy: (path: string, body?: unknown) => Promise<Response>
   disconnect: () => void
+  /** V1 `session.status`: busy/retry sessions by id, fed from the event stream. Idle ones are absent. */
+  sessionStatus?: () => Record<string, unknown>
 }
 
 export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unknown[]): (req: Request) => Promise<Response> {
-  // deps legitimately carries client and directory (it needs them for the routes it
+  // deps legitimately carries api and directory (it needs them for the routes it
   // builds), so the shared shape check used elsewhere would false-positive here — this
   // export only ever takes one argument for real, so a second one is the loader misfire.
   if (rest.length > 0) return {} as unknown as (req: Request) => Promise<Response>
-  const { client, directory, token: tok, getState, listSessions, messagesOf, questionProxy, disconnect } = deps
+  const { api, directory, token: tok, getState, questionProxy, disconnect } = deps
+  const listSessions = deps.listSessions ?? (() => webSessions(api, directory))
+  const messagesOf = deps.messagesOf ?? ((sid: string) => webMessages(api, sid))
+  const sessionStatus = deps.sessionStatus ?? (() => ({}))
 
-  const sdk = async (
-    run: () => Promise<{ data?: unknown; error?: unknown; response?: { status?: number } }>,
-  ): Promise<Response> => {
-    const res = await run()
-    if (res.error !== undefined && res.error !== null) return json(res.error, res.response?.status ?? 500)
-    return json(res.data)
+  // Runs one host call and answers with its (already V1-shaped) result, or with
+  // the upstream error and its own status. `undefined` (a V2 call with no body)
+  // answers 200 with an empty body, as the V1 SDK passthrough did.
+  const sdk = async (run: () => Promise<unknown>): Promise<Response> => {
+    try {
+      const data = await run()
+      return data === undefined ? new Response(null, { status: 200 }) : json(data)
+    } catch (e) {
+      return failure(e)
+    }
   }
 
   return async (req: Request): Promise<Response> => {
@@ -685,7 +1040,8 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
 
     // Native opencode REST surface so native clients (opencode-ios, any REST
     // app) can manage this TUI's sessions through the tunnel. Auth: Basic
-    // opencode:<token> or ?t=/x-oc-token.
+    // opencode:<token> or ?t=/x-oc-token. Paths and shapes are opencode's V1
+    // REST API; each one is served from the V2 plugin context and mapped back.
     const parts = seg.split("/").filter(Boolean)
     if (
       parts[0] === "session" ||
@@ -698,30 +1054,23 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
       try {
         if (seg === "/event" && req.method === "GET") return openInstanceEventStream(directory)
         // The model and agent catalogues, so a remote client can render a
-        // picker instead of guessing at the instance defaults. Both are
-        // returned exactly as the SDK gives them — each provider carries its
-        // own `models` map alongside a `default` map — because reshaping
-        // here would only date the client.
+        // picker instead of guessing at the instance defaults: providers each
+        // carry their own `models` map alongside a `default` map, as V1 did.
         if (seg === "/config/providers" && req.method === "GET") {
-          return sdk(() => client.config.providers({ query: { directory } }))
+          return sdk(() => v1Providers(api, directory))
         }
         if (seg === "/agent" && req.method === "GET") {
-          return sdk(() => client.app.agents({ query: { directory } }))
+          return sdk(() => v1Agents(api, directory))
         }
         // The catalogue behind POST /session/:id/command. Without it a remote
         // client has to know a command's name up front, so it cannot offer a
-        // command menu at all. Returned untouched like the other catalogues:
-        // every entry carries its own `template`, `source` and optional
-        // agent/model overrides, and reshaping here would only date the client.
+        // command menu at all.
         if (seg === "/command" && req.method === "GET") {
-          return sdk(() => client.command.list({ query: { directory } }))
+          return sdk(() => v1Commands(api, directory))
         }
         // The question tool. The assistant blocks until a request is answered
         // or rejected, so a remote client needs all three routes or a question
-        // asked over the tunnel strands the session with no way out. The
-        // matching `question.asked` / `question.replied` / `question.rejected`
-        // events already reach clients on /event, which forwards every event
-        // type untouched.
+        // asked over the tunnel strands the session with no way out.
         if (parts[0] === "question") {
           if (parts.length === 1 && req.method === "GET") return questionProxy("question")
           const requestID = parts[1]
@@ -739,43 +1088,58 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
         }
         if (parts[0] !== "session") return json({ error: "not found" }, 404)
         if (parts.length === 1) {
-          if (req.method === "GET") return sdk(() => client.session.list({ query: { directory } }))
+          if (req.method === "GET") {
+            return sdk(async () => (await listV2Sessions(api, directory)).map((s) => toV1Session(s, directory)))
+          }
           if (req.method === "POST") {
             const body = (await req.json().catch(() => ({}))) as { title?: string }
-            return sdk(() => client.session.create({ body: { title: body.title }, query: { directory } }))
+            return sdk(async () =>
+              toV1Session(
+                await api.session.create({
+                  ...(typeof body.title === "string" ? { title: body.title } : {}),
+                  location: { directory },
+                }),
+                directory,
+              ),
+            )
           }
         }
         if (parts.length === 2 && parts[1] === "status" && req.method === "GET") {
-          return sdk(() => client.session.status({ query: { directory } }))
+          return json(sessionStatus())
         }
-        // Rename. The SDK's session.update takes a partial session, but the
-        // only field worth exposing to a remote client is the title, and a
-        // blank one is rejected here rather than quietly clearing it.
+        // Rename. The only field worth exposing to a remote client is the
+        // title, and a blank one is rejected here rather than quietly clearing
+        // it. V2's update answers nothing, so the renamed session is read back
+        // to answer with it as V1 did.
         if (parts.length === 2 && req.method === "PATCH") {
-          const id = parts[1]
+          const id = parts[1]!
           const body = (await req.json().catch(() => ({}))) as { title?: unknown }
           const title = typeof body.title === "string" ? body.title.trim() : ""
           if (title.length === 0) return json({ error: "title required" }, 400)
-          return sdk(() => client.session.update({ path: { id }, body: { title }, query: { directory } }))
+          return sdk(async () => {
+            await api.session.update({ sessionID: id, title })
+            return toV1Session(await api.session.get({ sessionID: id }), directory)
+          })
         }
-        // Delete. Like the other per-id routes it proxies through the SDK and
-        // re-emits an upstream error (an unknown id included) with its own
-        // status and body instead of succeeding silently. Deletion is
-        // permanent — the confirmation guard lives in the client, not here.
+        // Delete. Like the other per-id routes it re-emits an upstream error
+        // (an unknown id included) with its own status and body instead of
+        // succeeding silently. Deletion is permanent — the confirmation guard
+        // lives in the client, not here.
         if (parts.length === 2 && req.method === "DELETE") {
-          const id = parts[1]
-          return sdk(() => client.session.delete({ path: { id }, query: { directory } }))
+          const id = parts[1]!
+          return sdk(async () => {
+            await api.session.remove({ sessionID: id })
+            return true
+          })
         }
         if (parts.length >= 3) {
-          const id = parts[1]
+          const id = parts[1]!
           if (parts[2] === "message" && req.method === "GET") {
             const limit = Number(url.searchParams.get("limit"))
-            return sdk(() =>
-              client.session.messages({
-                path: { id },
-                query: { ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}), directory },
-              }),
-            )
+            return sdk(async () => {
+              const rows = await v1Messages(api, id)
+              return Number.isFinite(limit) && limit > 0 ? rows.slice(-limit) : rows
+            })
           }
           if (parts[2] === "prompt_async" && req.method === "POST") {
             const body = (await req.json().catch(() => ({}))) as {
@@ -784,18 +1148,22 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
               agent?: unknown
             }
             const promptParts = pickPromptParts(body.parts)
+            if (promptParts.length === 0) return json({ error: "parts required" }, 400)
             const model = pickModel(body.model)
             const agent = pickAgent(body.agent)
-            return sdk(() =>
-              client.session.promptAsync({
-                path: { id },
-                body: { parts: promptParts, ...(model ? { model } : {}), ...(agent ? { agent } : {}) },
-                query: { directory },
-              }),
-            )
+            return sdk(async () => {
+              await applySelection(api, id, model, agent)
+              await api.session.prompt({ sessionID: id, ...toPromptInput(promptParts) })
+              return undefined
+            })
           }
           if (parts[2] === "abort" && req.method === "POST") {
-            return sdk(() => client.session.abort({ path: { id }, query: { directory } }))
+            // V2's interrupt answers `false` for an id it does not know; V1 failed
+            // with the session's not-found error, so the id is checked first.
+            return sdk(async () => {
+              await api.session.get({ sessionID: id })
+              return (await api.session.interrupt({ sessionID: id })).interrupted
+            })
           }
           if (parts[2] === "command" && req.method === "POST") {
             const body = (await req.json().catch(() => ({}))) as {
@@ -805,31 +1173,25 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
               model?: unknown
               agent?: unknown
             }
-            const model = pickCommandModel(body.model)
+            const model = pickModel(splitCommandModel(pickCommandModel(body.model)))
             const agent = pickAgent(body.agent)
-            return sdk(() =>
-              client.session.command({
-                path: { id },
-                body: {
-                  command: body.command ?? "",
-                  arguments: body.arguments ?? "",
-                  ...(body.messageID ? { messageID: body.messageID } : {}),
-                  ...(model ? { model } : {}),
-                  ...(agent ? { agent } : {}),
-                },
-                query: { directory },
-              }),
-            )
+            return sdk(async () => {
+              await applySelection(api, id, model, agent)
+              await api.session.command({ sessionID: id, name: body.command ?? "", text: body.arguments ?? "" })
+              return undefined
+            })
           }
           if (parts[2] === "permissions" && parts[3] && req.method === "POST") {
-            const body = (await req.json().catch(() => ({}))) as { response?: string }
-            return sdk(() =>
-              client.postSessionIdPermissionsPermissionId({
-                path: { id, permissionID: parts[3] },
-                body: { response: body.response as never },
-                query: { directory },
-              }),
-            )
+            const body = (await req.json().catch(() => ({}))) as { response?: unknown }
+            const decision = body.response
+            if (decision !== "once" && decision !== "always" && decision !== "reject") {
+              return json({ error: "response must be once, always or reject" }, 400)
+            }
+            const requestID = parts[3]
+            return sdk(async () => {
+              await api.permission.reply({ sessionID: id, requestID, decision })
+              return true
+            })
           }
         }
       } catch (e) {
@@ -854,17 +1216,13 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
     if (url.pathname === "/api/send" && req.method === "POST") {
       const body = (await req.json()) as { session?: string; text?: string }
       if (!body.session || !body.text?.trim()) return json({ error: "session and text required" }, 400)
-      await client.session.promptAsync({
-        path: { id: body.session },
-        body: { parts: [{ type: "text", text: body.text.trim() }] },
-        query: { directory },
-      })
+      await api.session.prompt({ sessionID: body.session, text: body.text.trim() })
       return json({ ok: true, queued: true })
     }
 
     if (url.pathname === "/api/new" && req.method === "POST") {
-      const res = await client.session.create({ body: { title: "remote" }, query: { directory } })
-      return json({ id: res.data?.id })
+      const created = await api.session.create({ title: "remote", location: { directory } })
+      return json({ id: created?.id })
     }
 
     if (url.pathname === "/api/events") {
@@ -902,6 +1260,15 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
   }
 }
 
+// pickCommandModel yields V1's "provider/model" string; the V2 switch takes the
+// pair back apart (the model id itself may contain "/", the provider never does).
+function splitCommandModel(value: string | undefined): PromptModel | undefined {
+  if (!value) return undefined
+  const slash = value.indexOf("/")
+  if (slash <= 0 || slash === value.length - 1) return undefined
+  return { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) }
+}
+
 /**
  * Live SDK event feed, in the shape native clients already speak: opencode's
  * own /global/event wraps every event as { directory, payload } and the app
@@ -927,9 +1294,8 @@ export function openInstanceEventStream(directory: string, ...rest: unknown[]): 
     log(`event stream closed (${reason}) open=${openEventStreams}`)
   }
 
-  // Events come from the plugin's own `event` hook (forwardInstanceEvent), NOT
-  // from client.event.subscribe(): inside a TUI-hosted instance that SDK
-  // subscription never yields, while the hook fires in every mode.
+  // Events come from the plugin's own V2 event subscription (ctx.event.subscribe,
+  // mapped to the V1 { type, properties } shape and pushed via forwardInstanceEvent).
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       openEventStreams++
@@ -1003,6 +1369,52 @@ export function forwardInstanceEvent(directory: string, event: RemoteControlEven
       }
     }
   }
+}
+
+const EXECUTION_ENDED = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"])
+
+/**
+ * One V2 event from the plugin's subscription, relayed to this directory's
+ * clients in V1 shape. opencode 2 reports a session's run as
+ * `session.execution.*` (and retries as `session.retry.scheduled`) where V1
+ * sent `session.status` / `session.idle`, so those two are synthesised after
+ * the original event, and `statuses` (V1's session.status map: busy and
+ * retrying sessions only) is kept from the same events. Events located in
+ * another directory are skipped; one without a location is kept.
+ */
+export function relayInstanceEvent(directory: string, raw: unknown, statuses: Map<string, unknown>): void {
+  const located = asLoose(asLoose(raw).location).directory
+  if (typeof located === "string" && !sameDirectory(located, directory)) return
+  const event = toV1Event(raw)
+  forwardInstanceEvent(directory, event)
+  const props = asLoose(event.properties)
+  const sessionID = str(props.sessionID)
+  if (!sessionID) return
+  const status = (value: unknown) => forwardInstanceEvent(directory, { type: "session.status", properties: { sessionID, status: value } })
+  if (event.type === "session.status") {
+    if (asLoose(props.status).type === "idle") statuses.delete(sessionID)
+    else statuses.set(sessionID, props.status)
+  } else if (event.type === "session.execution.started") {
+    statuses.set(sessionID, { type: "busy" })
+    status({ type: "busy" })
+  } else if (event.type === "session.retry.scheduled") {
+    const { sessionID: _id, ...retry } = props
+    const value = { ...retry, type: "retry" }
+    statuses.set(sessionID, value)
+    status(value)
+  } else if (EXECUTION_ENDED.has(event.type)) {
+    statuses.delete(sessionID)
+    status({ type: "idle" })
+    forwardInstanceEvent(directory, { type: "session.idle", properties: { sessionID } })
+  } else if (event.type === "session.deleted") {
+    statuses.delete(sessionID)
+  }
+}
+
+/** Same comparison for Windows paths that differ only in slash direction, case or a trailing slash. */
+function sameDirectory(a: string, b: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+  return norm(a) === norm(b)
 }
 
 // ── Hub ─────────────────────────────────────────────────────────────────────
@@ -1254,110 +1666,77 @@ loadSessions();
 const REMOTE_CONTROL_SYSTEM_PROMPT = `Remote control (plugin primitive)
 \`remote_control\` registers this session with the phone/browser client on the user's tailnet, so the conversation can be picked up from another device. Call it whenever the user asks about remote control or runs \`/remote-control\`, mapping their words to the action: empty or "toggle" toggles, "on" and "off" force a state, "status" reports, "pair" prints the once-per-machine pairing URL. Report every URL it returns verbatim - they carry tokens, so a paraphrase is useless. A connected phone streams this transcript live and drives the session through the same API, so nothing special is needed on your side while it is on: work exactly as you normally would.`
 
-export const RemoteControlPlugin: Plugin = async ({ client, directory, serverUrl }) => {
-  log(`plugin loaded dir=${directory} serverUrl=${serverUrl?.href ?? "-"} pid=${process.pid}`)
-  async function listSessions(): Promise<SessionRow[]> {
-    const result = await client.session.list({ query: { directory } })
-    const rows = (result.data ?? []) as Array<Record<string, unknown>>
-    return rows
-      .map((s) => ({ id: String(s.id), title: (s.title as string) ?? "", updatedAt: s.updatedAt as number | undefined }))
-      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-  }
+const REMOTE_CONTROL_TOOL_DESCRIPTION = `Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet.
 
-  async function messagesOf(sid: string): Promise<Array<{ role: string; text: string }>> {
-    const result = await client.session.messages({ path: { id: sid }, query: { directory } })
-    const rows = (result.data ?? []) as MessageRow[]
-    const out: Array<{ role: string; text: string }> = []
-    for (const row of rows) {
-      const chunks: string[] = []
-      for (const part of row.parts ?? []) {
-        if (part.type === "text" && part.text) chunks.push(part.text)
-        else if (part.type === "tool" && part.tool) chunks.push(`[${part.tool}${part.state?.status ? " " + part.state.status : ""}]`)
-      }
-      const text = chunks.join("\n").trim()
-      if (text) out.push({ role: row.info?.role ?? "assistant", text })
-    }
-    return out
-  }
+This tool backs the /remote-control command — always call it, never answer from memory. Map the command's argument words to \`action\`:
+- empty, "toggle" → toggle (connects when off, disconnects when on)
+- "on", "start" → on
+- "off", "stop", "disconnect", "unregister" → off
+- "status" → status
+- "pair" → pair (prints the machine pair URL to paste into the phone app once)
+- "rotate-pairing", "rotate" → rotate-pairing (mints a new pairing token; the old one stops working, so the app has to be re-paired)
+Any other argument is a display name: pass it as \`name\` with action toggle (a name is only meaningful when connecting).
+
+Report the tool output verbatim — especially the URL and any enable link. Never invent or modify the URL. If the output says Serve is not enabled, tell the user to click the enable link first.`
+
+const REMOTE_CONTROL_ACTIONS = ["toggle", "on", "off", "status", "pair", "rotate-pairing"] as const
+type RemoteControlAction = (typeof REMOTE_CONTROL_ACTIONS)[number]
+
+// JSON Schema for the tool input: the same fields, enum and descriptions the V1
+// zod schema declared.
+const REMOTE_CONTROL_INPUT = {
+  type: "object",
+  properties: {
+    action: {
+      type: "string",
+      enum: [...REMOTE_CONTROL_ACTIONS],
+      description:
+        "toggle = flip on/off (default for a bare /remote-control), on = register, off = unregister, status = report, pair = print the machine pair URL for the app, rotate-pairing = mint a new pairing token and invalidate the old one",
+    },
+    name: {
+      type: "string",
+      description: "optional display name shown in the remote session list; only meaningful when connecting",
+    },
+  },
+  required: ["action"],
+}
+
+function readToolInput(input: unknown): { action: RemoteControlAction; name?: string } {
+  const raw = asLoose(input)
+  const action = REMOTE_CONTROL_ACTIONS.find((a) => a === raw.action) ?? "toggle"
+  const name = str(raw.name)
+  return { action, ...(name ? { name } : {}) }
+}
+
+async function setup(ctx: Plugin.Context): Promise<() => void> {
+  const api: RemoteControlApi = ctx
+  const directory: string = ctx.location.directory
+  log(`plugin loaded dir=${directory} pid=${process.pid}`)
 
   /**
-   * The question tool is newer than the SDK surface this plugin builds against:
-   * `client` is the v1 OpencodeClient, and no published version of it carries a
-   * `question` namespace — only `@opencode-ai/sdk/v2` does, behind a subpath a
-   * plugin cannot count on resolving inside opencode's loader. `serverUrl` is
-   * the very opencode server this plugin runs inside, so the question routes are
-   * proxied with a plain fetch against the same paths the v2 client would call,
-   * status and body passed straight through like the SDK-backed routes.
+   * V1's question tool (and its /question routes) does not exist in opencode 2:
+   * asking the user is a "form" there, and the plugin context exposes no form
+   * API to answer one with. The routes stay so a client gets the same explicit
+   * 502 a V1 instance gave when it could not reach them, rather than a 404.
    */
-  /**
-   * The SDK the plugin builds against has no `question` namespace, and inside
-   * a TUI-hosted (or `opencode run`) instance `serverUrl` points at a port
-   * nothing listens on: the server lives in-process. The runtime client does
-   * expose its underlying transport as `_client` (get/post over the same
-   * in-process fetch every other SDK call uses), so the question routes ride
-   * on that, with a plain fetch against `serverUrl` as the fallback for
-   * `opencode serve`, where the port is real. Never throws: an escaping
-   * handler error has killed a TUI process before.
-   */
-  type InnerResult = { data?: unknown; error?: unknown; response?: { status?: number } }
-  type InnerClient = {
-    get: (o: { url: string; query?: Record<string, unknown> }) => Promise<InnerResult>
-    post: (o: { url: string; query?: Record<string, unknown>; body?: unknown }) => Promise<InnerResult>
-  }
-  const inner = (client as unknown as { _client?: InnerClient })._client
-
-  async function questionViaInner(path: string, body: unknown | undefined): Promise<Response> {
-    if (!inner) throw new Error("no inner client")
-    const url = `/${path}`
-    const res =
-      body === undefined
-        ? await inner.get({ url, query: { directory } })
-        : await inner.post({ url, query: { directory }, body })
-    const status = res.response?.status ?? (res.error !== undefined && res.error !== null ? 500 : 200)
-    if (res.error !== undefined && res.error !== null) return json(res.error, status)
-    return json(res.data ?? true, status)
+  async function questionProxy(path: string, _body?: unknown): Promise<Response> {
+    log(`question route ${path} unavailable: opencode 2 has no question API for plugins`)
+    return json({ error: "question routes unavailable on this instance" }, 502)
   }
 
-  async function questionViaFetch(path: string, body: unknown | undefined): Promise<Response> {
-    const base = serverUrl.href.endsWith("/") ? serverUrl.href : serverUrl.href + "/"
-    const target = new URL(path, base)
-    target.searchParams.set("directory", directory)
-    const upstream = await fetch(target, {
-      method: body === undefined ? "GET" : "POST",
-      ...(body === undefined
-        ? {}
-        : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-    })
-    return new Response(await upstream.text(), {
-      status: upstream.status,
-      headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
-    })
-  }
-
-  async function questionProxy(path: string, body?: unknown): Promise<Response> {
-    try {
-      return await questionViaInner(path, body)
-    } catch (innerError) {
-      log(`question inner transport failed for ${path}: ${String(innerError).slice(0, 120)}`)
-    }
-    try {
-      return await questionViaFetch(path, body)
-    } catch (e) {
-      log(`question proxy failed for ${path} via ${serverUrl?.href ?? "-"}: ${String(e).slice(0, 160)}`)
-      return json({ error: "question routes unavailable on this instance" }, 502)
-    }
-  }
+  // V1's session.status: sessions that are busy or retrying, kept by
+  // relayInstanceEvent from the event subscription. Idle sessions are absent.
+  const statuses = new Map<string, unknown>()
 
   function makeHandler(tok: string, getState: () => RemoteState | undefined) {
     return makeInstanceRouteHandler({
-      client,
+      api,
       directory,
       token: tok,
       getState,
-      listSessions,
-      messagesOf,
       questionProxy,
       disconnect: stop,
+      sessionStatus: () => Object.fromEntries(statuses),
     })
   }
 
@@ -1473,74 +1852,80 @@ ${serve.out}`
     void start(resume.name, resume.defaultSession)
   }
 
-  return {
-    "experimental.chat.system.transform": async (_input, output) => {
-      try {
-        if (output.system.includes(REMOTE_CONTROL_SYSTEM_PROMPT)) return
-        output.system.push(REMOTE_CONTROL_SYSTEM_PROMPT)
-      } catch {}
-    },
-    tool: {
-      remote_control: tool({
-        description: `Register (or unregister) the current opencode session for Remote Control: continue this conversation from a phone, tablet, or any browser on your tailnet.
+  await ctx.session.hook("context", (input) => {
+    try {
+      if (input.system.some((part) => part.text === REMOTE_CONTROL_SYSTEM_PROMPT)) return
+      input.system.push({ type: "text", text: REMOTE_CONTROL_SYSTEM_PROMPT })
+    } catch {}
+  })
 
-This tool backs the /remote-control command — always call it, never answer from memory. Map the command's argument words to \`action\`:
-- empty, "toggle" → toggle (connects when off, disconnects when on)
-- "on", "start" → on
-- "off", "stop", "disconnect", "unregister" → off
-- "status" → status
-- "pair" → pair (prints the machine pair URL to paste into the phone app once)
-- "rotate-pairing", "rotate" → rotate-pairing (mints a new pairing token; the old one stops working, so the app has to be re-paired)
-Any other argument is a display name: pass it as \`name\` with action toggle (a name is only meaningful when connecting).
+  await ctx.tool.transform((tools) => {
+    tools.add({
+      name: "remote_control",
+      description: REMOTE_CONTROL_TOOL_DESCRIPTION,
+      input: REMOTE_CONTROL_INPUT,
+      async execute(input, context) {
+        return { content: await runTool(readToolInput(input), context.sessionID) }
+      },
+    })
+  })
 
-Report the tool output verbatim — especially the URL and any enable link. Never invent or modify the URL. If the output says Serve is not enabled, tell the user to click the enable link first.`,
-        args: {
-          action: tool.schema
-            .enum(["toggle", "on", "off", "status", "pair", "rotate-pairing"])
-            .describe(
-              "toggle = flip on/off (default for a bare /remote-control), on = register, off = unregister, status = report, pair = print the machine pair URL for the app, rotate-pairing = mint a new pairing token and invalidate the old one",
-            ),
-          name: tool.schema.string().optional().describe("optional display name shown in the remote session list; only meaningful when connecting"),
-        },
-        async execute(args, context) {
-          if (args.action === "toggle") return server ? stop() : start(args.name || undefined, context.sessionID)
-          if (args.action === "off") return stop()
-          if (args.action === "pair" || args.action === "rotate-pairing") {
-            if (args.action === "rotate-pairing") rotatePairingToken()
-            const url = pairUrl()
-            if (!url) return "could not read tailnet hostname (tailscale status failed) — is Tailscale running?"
-            // Bring the hub up now so the app can verify the pairing straight
-            // away, before any session has run /remote-control.
-            publishHub()
-            ensureHub()
-            return [
-              url,
-              args.action === "rotate-pairing"
-                ? "New pairing token. Paste this URL into the app once; the previous one no longer works."
-                : "Paste this URL into the app once. Every instance that runs /remote-control on this machine then shows up automatically.",
-            ].join("\n")
-          }
-          if (args.action === "status") {
-            const regs = loadRegistrations()
-            if (regs.length === 0) return "Remote Control: not active. Run /remote-control to register this session."
-            const lines: string[] = []
-            for (const r of regs) {
-              const mine = r.pid === process.pid ? " (this process)" : ""
-              lines.push(
-                `${r.name}${mine} — active since ${new Date(r.startedAt).toLocaleTimeString()}\n  URL: ${r.url}\n  Default session: ${r.defaultSession}`,
-              )
-            }
-            return `Remote Control: ${regs.length} active registration(s)\n${lines.join("\n")}`
-          }
-          return start(args.name || undefined, context.sessionID)
-        },
-      }),
-    },
-    event: async ({ event }) => {
-      forwardInstanceEvent(directory, event)
-    },
-    async dispose() {
-      stop(false)
-    },
+  async function runTool(args: { action: RemoteControlAction; name?: string }, sessionID: string): Promise<string> {
+    if (args.action === "toggle") return server ? stop() : start(args.name || undefined, sessionID)
+    if (args.action === "off") return stop()
+    if (args.action === "pair" || args.action === "rotate-pairing") {
+      if (args.action === "rotate-pairing") rotatePairingToken()
+      const url = pairUrl()
+      if (!url) return "could not read tailnet hostname (tailscale status failed) — is Tailscale running?"
+      // Bring the hub up now so the app can verify the pairing straight
+      // away, before any session has run /remote-control.
+      publishHub()
+      ensureHub()
+      return [
+        url,
+        args.action === "rotate-pairing"
+          ? "New pairing token. Paste this URL into the app once; the previous one no longer works."
+          : "Paste this URL into the app once. Every instance that runs /remote-control on this machine then shows up automatically.",
+      ].join("\n")
+    }
+    if (args.action === "status") {
+      const regs = loadRegistrations()
+      if (regs.length === 0) return "Remote Control: not active. Run /remote-control to register this session."
+      const lines: string[] = []
+      for (const r of regs) {
+        const mine = r.pid === process.pid ? " (this process)" : ""
+        lines.push(
+          `${r.name}${mine} — active since ${new Date(r.startedAt).toLocaleTimeString()}\n  URL: ${r.url}\n  Default session: ${r.defaultSession}`,
+        )
+      }
+      return `Remote Control: ${regs.length} active registration(s)\n${lines.join("\n")}`
+    }
+    return start(args.name || undefined, sessionID)
+  }
+
+  // V1's `event` hook is a subscription in V2; relayInstanceEvent maps each
+  // event to the V1 shape the native clients parse.
+  const subscription = new AbortController()
+  void (async () => {
+    try {
+      for await (const raw of ctx.event.subscribe({ signal: subscription.signal })) {
+        try {
+          relayInstanceEvent(directory, raw, statuses)
+        } catch (e) {
+          log(`event forward failed: ${String(e).slice(0, 160)}`)
+        }
+      }
+    } catch (e) {
+      if (!subscription.signal.aborted) log(`event subscription ended: ${String(e).slice(0, 160)}`)
+    }
+  })()
+
+  return () => {
+    subscription.abort()
+    stop(false)
   }
 }
+
+export const RemoteControlPlugin = { id: "remote-control", setup } satisfies Plugin.Plugin
+
+export default RemoteControlPlugin
