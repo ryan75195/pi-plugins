@@ -9,12 +9,14 @@
  *     binary frames become placeholders, >1MiB frames end the watch, close
  *     ends the watch with its code.
  *
- * Events are delivered as queued messages (promptAsync), so the agent
- * interjects between/after turns. Watches end at their deadline unless
- * `persistent`, and `monitor_stop` cancels them early.
+ * Events are delivered as queued synthetic messages (session inbox, `queue`
+ * delivery with `resume`), so the agent interjects between/after turns and an
+ * idle session wakes up. Watches end at their deadline unless `persistent`,
+ * and `monitor_stop` cancels them early.
+ *
+ * Written against the opencode 2.3 (V2) plugin API.
  */
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { spawn, type ChildProcess } from "node:child_process"
 import { readFile, writeFile } from "node:fs/promises"
 import { createInterface } from "node:readline"
@@ -170,294 +172,339 @@ function privateIP(ip: string): boolean {
 const MONITOR_SYSTEM_PROMPT = `Monitor (plugin primitive)
 Never sleep, poll in a loop, or re-run a command repeatedly to wait for something - a server to come up, tests or CI to finish, a log line to appear, a file to change. Start a \`monitor\` watch instead and keep the turn moving; waiting is not work. Write the watch command so it prints only the interesting lines (filter inside the command with grep/Select-String/tail) and give it a short description. \`[monitor ...]\` messages that show up later in the conversation are real events that just happened: report or act on them straight away, without re-running the watch command. Stop a watch with \`monitor_stop\` as soon as it stops being relevant.`
 
-export const MonitorPlugin: Plugin = async ({ client, directory }) => {
-  const watches = new Map<string, Watch>()
+interface MonitorArgs {
+  description: string
+  command?: string
+  ws_url?: string
+  ws_protocols?: string
+  pattern?: string
+  timeout_ms?: number
+  persistent?: boolean
+}
 
-  const deliver = async (w: Watch, text: string) => {
-    try {
-      await client.session.promptAsync({
-        path: { id: w.sessionID },
-        body: { parts: [{ type: "text", text, metadata: { source: "plugin" } }] },
-        query: { directory: w.directory },
-      })
-    } catch {
-      /* session may be gone; the watch still ends cleanly */
-    }
-  }
+interface MonitorStopArgs {
+  id?: string
+}
 
-  function end(w: Watch, reason: string) {
-    if (w.ended) return
-    w.ended = true
-    w.endedAt = Date.now()
-    if (w.flushTimer) clearTimeout(w.flushTimer)
-    if (w.proc?.pid) {
+export default Plugin.define({
+  id: "monitor",
+  async setup(ctx) {
+    const directory: string = ctx.location.directory
+    const watches = new Map<string, Watch>()
+
+    const deliver = async (w: Watch, text: string) => {
+      // A synthetic message queued into the session's inbox: held while the
+      // session is busy, and `resume` wakes an idle session so the agent reacts.
       try {
-        if (process.platform === "win32") spawn("taskkill", ["/T", "/F", "/PID", String(w.proc.pid)], { windowsHide: true })
-        else w.proc.kill("SIGTERM")
+        await ctx.session.synthetic({
+          sessionID: w.sessionID,
+          text,
+          description: `[monitor ${w.id}] ${w.description}`,
+          metadata: { source: "plugin" },
+          delivery: "queue",
+          resume: true,
+        })
       } catch {
-        /* already gone */
+        /* session may be gone; the watch still ends cleanly */
       }
     }
-    try {
-      w.sock?.close()
-    } catch {
-      /* already closed */
-    }
-    watches.delete(w.id)
-    persist(watches)
-    void publishSnapshot(w)
-    setTimeout(() => void pruneSnapshot(w.id), 60_000).unref?.()
-    void deliver(
-      w,
-      w.buffered.length
-        ? `[monitor ${w.id} ${w.description} ended: ${reason}]\n(final lines)\n${w.buffered.map(clip).join("\n")}`
-        : `[monitor ${w.id} ${w.description} ended: ${reason}]`,
-    )
-  }
 
-  function flush(w: Watch) {
-    w.flushTimer = undefined
-    if (w.ended || w.buffered.length === 0) return
-    if (w.events >= MAX_EVENTS) {
-      end(w, "event budget reached")
-      return
-    }
-    const lines = w.buffered.splice(0, MAX_LINES_PER_EVENT)
-    w.events += 1
-    void deliver(w, `[monitor ${w.id} ${w.description}] event ${w.events}\n${lines.map(clip).join("\n")}`)
-    if (w.buffered.length > 0 || lines.length === MAX_LINES_PER_EVENT) {
-      w.flushTimer = setTimeout(() => flush(w), FLUSH_INTERVAL_MS)
-    }
-  }
-
-  function line(w: Watch, text: string) {
-    if (w.ended) return
-    if (w.pattern && !w.pattern.test(text)) return
-    w.buffered.push(text)
-    if (!w.flushTimer) w.flushTimer = setTimeout(() => flush(w), FLUSH_INTERVAL_MS)
-    if (w.buffered.length >= MAX_LINES_PER_EVENT) flush(w)
-  }
-
-  function startCommand(id: string, w: Watch, command: string): string | undefined {
-    const proc = spawn(command, {
-      shell: process.platform === "win32" ? true : "/bin/sh",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    })
-    w.proc = proc
-    let first = true
-    for (const stream of [proc.stdout, proc.stderr]) {
-      if (!stream) continue
-      const rl = createInterface({ input: stream as NodeJS.ReadableStream })
-      rl.on("line", (l) => {
-        if (first && w.source === "command") first = false
-        line(w, l)
-      })
-    }
-    proc.on("error", (e) => end(w, `spawn error: ${e.message}`))
-    proc.on("exit", (code) => {
-      if (!w.ended) end(w, `command exited (code ${code ?? "signal"})`)
-    })
-    return undefined
-  }
-
-  async function startWebSocket(id: string, w: Watch, url: string, protocols: string[]): Promise<string | undefined> {
-    let parsed: URL
-    try {
-      parsed = new URL(url)
-    } catch {
-      return `invalid WebSocket URL: ${url}`
-    }
-    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return "ws_url must use ws:// or wss://"
-    if (!/^[\x21-\x7E]+$/.test(url) || url.includes("@")) return "URL must be ASCII with no embedded credentials or whitespace"
-    if (await isPrivateHost(parsed.hostname)) return `refused: ${parsed.hostname} resolves to a private/link-local/metadata address`
-    if (new Set(protocols).size !== protocols.length) return "duplicate WebSocket subprotocols"
-
-    const sock = new WebSocket(url, protocols.length ? protocols : undefined)
-    w.sock = sock
-    sock.addEventListener("message", (ev) => {
+    function end(w: Watch, reason: string) {
       if (w.ended) return
-      const data = ev.data
-      if (typeof data === "string") {
-        for (const l of data.split("\n")) line(w, l)
-        return
-      }
-      const size = data instanceof ArrayBuffer ? data.byteLength : data instanceof Uint8Array ? data.byteLength : 0
-      if (size > MAX_WS_FRAME) {
-        end(w, `frame too large (${size} bytes > 1MiB)`)
-        return
-      }
-      line(w, `[binary frame, ${size} bytes]`)
-    })
-    sock.addEventListener("close", (ev) => {
-      if (!w.ended) end(w, `socket closed (code ${ev.code ?? "unknown"})`)
-    })
-    sock.addEventListener("error", () => {
-      if (!w.ended) end(w, "socket error")
-    })
-    return undefined
-  }
-
-  async function start(args: {
-    description: string
-    command?: string
-    ws_url?: string
-    ws_protocols?: string
-    pattern?: string
-    timeout_ms?: number
-    persistent?: boolean
-  }, sessionID: string): Promise<string> {
-    if (!args.command && !args.ws_url) return "provide either `command` or `ws_url`"
-    if (args.command && args.ws_url) return "provide only one of `command` or `ws_url`"
-    let pattern: RegExp | undefined
-    if (args.pattern) {
-      try {
-        pattern = new RegExp(args.pattern)
-      } catch (e) {
-        return `invalid pattern: ${e}`
-      }
-    }
-    const id = "m" + randomBytes(3).toString("hex")
-    const timeout = args.persistent ? Infinity : Math.max(1000, args.timeout_ms ?? DEFAULT_TIMEOUT_MS)
-    const w: Watch = {
-      id,
-      description: args.description || args.command || args.ws_url || "watch",
-      sessionID,
-      directory,
-      source: args.ws_url ? "ws" : "command",
-      target: args.command ?? args.ws_url ?? "",
-      pattern,
-      startedAt: Date.now(),
-      timeoutAt: timeout === Infinity ? Infinity : Date.now() + timeout,
-      events: 0,
-      buffered: [],
-      ended: false,
-    }
-
-    let err: string | undefined
-    if (args.ws_url) {
-      const protocols = (args.ws_protocols ?? "").split(",").map((s) => s.trim()).filter(Boolean)
-      err = await startWebSocket(id, w, args.ws_url, protocols)
-    } else {
-      err = startCommand(id, w, args.command as string)
-    }
-    if (err) {
       w.ended = true
-      return err
-    }
-
-    watches.set(id, w)
-    persist(watches)
-    void publishSnapshot(w)
-
-    if (timeout !== Infinity) {
-      setTimeout(() => end(w, "timeout reached"), timeout).unref?.()
-    }
-    return [
-      `Watching (${id}): ${w.description}`,
-      args.ws_url ? `WebSocket feed: ${args.ws_url}` : `Command: ${args.command}`,
-      timeout === Infinity ? "Runs until monitor_stop or session end." : `Ends automatically at ${new Date(w.timeoutAt).toLocaleTimeString()} unless persistent.`,
-      `Each ${args.ws_url ? "message" : "output line"} arrives as an [monitor …] event message${pattern ? ` (filtered by /${args.pattern}/)` : ""} — react when they arrive, keep working otherwise.`,
-      `Stop with monitor_stop (id: ${id}).`,
-    ].join("\n")
-  }
-
-  function stopOne(id: string): string {
-    const w = watches.get(id)
-    if (!w) return `no active watch '${id}' (active: ${[...watches.keys()].join(", ") || "none"})`
-    end(w, "stopped by monitor_stop")
-    return `stopped ${id}`
-  }
-
-  // Consume stop requests from the shared requests file that target OUR watch
-  // ids, leaving entries owned by other plugins (e.g. background tasks).
-  let requestPoller: ReturnType<typeof setInterval> | undefined
-  function ensureRequestPoller() {
-    if (requestPoller) return
-    requestPoller = setInterval(() => {
-      void (async () => {
-        let stop: string[] = []
+      w.endedAt = Date.now()
+      if (w.flushTimer) clearTimeout(w.flushTimer)
+      if (w.proc?.pid) {
         try {
-          const raw = JSON.parse(await readFile(BG_REQUESTS_FILE, "utf8")) as { stop?: string[] }
-          stop = raw.stop ?? []
+          if (process.platform === "win32") spawn("taskkill", ["/T", "/F", "/PID", String(w.proc.pid)], { windowsHide: true })
+          else w.proc.kill("SIGTERM")
         } catch {
+          /* already gone */
+        }
+      }
+      try {
+        w.sock?.close()
+      } catch {
+        /* already closed */
+      }
+      watches.delete(w.id)
+      persist(watches)
+      void publishSnapshot(w)
+      setTimeout(() => void pruneSnapshot(w.id), 60_000).unref?.()
+      void deliver(
+        w,
+        w.buffered.length
+          ? `[monitor ${w.id} ${w.description} ended: ${reason}]\n(final lines)\n${w.buffered.map(clip).join("\n")}`
+          : `[monitor ${w.id} ${w.description} ended: ${reason}]`,
+      )
+    }
+
+    function flush(w: Watch) {
+      w.flushTimer = undefined
+      if (w.ended || w.buffered.length === 0) return
+      if (w.events >= MAX_EVENTS) {
+        end(w, "event budget reached")
+        return
+      }
+      const lines = w.buffered.splice(0, MAX_LINES_PER_EVENT)
+      w.events += 1
+      void deliver(w, `[monitor ${w.id} ${w.description}] event ${w.events}\n${lines.map(clip).join("\n")}`)
+      if (w.buffered.length > 0 || lines.length === MAX_LINES_PER_EVENT) {
+        w.flushTimer = setTimeout(() => flush(w), FLUSH_INTERVAL_MS)
+      }
+    }
+
+    function line(w: Watch, text: string) {
+      if (w.ended) return
+      if (w.pattern && !w.pattern.test(text)) return
+      w.buffered.push(text)
+      if (!w.flushTimer) w.flushTimer = setTimeout(() => flush(w), FLUSH_INTERVAL_MS)
+      if (w.buffered.length >= MAX_LINES_PER_EVENT) flush(w)
+    }
+
+    function startCommand(id: string, w: Watch, command: string): string | undefined {
+      const proc = spawn(command, {
+        shell: process.platform === "win32" ? true : "/bin/sh",
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      })
+      w.proc = proc
+      let first = true
+      for (const stream of [proc.stdout, proc.stderr]) {
+        if (!stream) continue
+        const rl = createInterface({ input: stream as NodeJS.ReadableStream })
+        rl.on("line", (l) => {
+          if (first && w.source === "command") first = false
+          line(w, l)
+        })
+      }
+      proc.on("error", (e) => end(w, `spawn error: ${e.message}`))
+      proc.on("exit", (code) => {
+        if (!w.ended) end(w, `command exited (code ${code ?? "signal"})`)
+      })
+      return undefined
+    }
+
+    async function startWebSocket(id: string, w: Watch, url: string, protocols: string[]): Promise<string | undefined> {
+      let parsed: URL
+      try {
+        parsed = new URL(url)
+      } catch {
+        return `invalid WebSocket URL: ${url}`
+      }
+      if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return "ws_url must use ws:// or wss://"
+      if (!/^[\x21-\x7E]+$/.test(url) || url.includes("@")) return "URL must be ASCII with no embedded credentials or whitespace"
+      if (await isPrivateHost(parsed.hostname)) return `refused: ${parsed.hostname} resolves to a private/link-local/metadata address`
+      if (new Set(protocols).size !== protocols.length) return "duplicate WebSocket subprotocols"
+
+      const sock = new WebSocket(url, protocols.length ? protocols : undefined)
+      w.sock = sock
+      sock.addEventListener("message", (ev) => {
+        if (w.ended) return
+        const data = ev.data
+        if (typeof data === "string") {
+          for (const l of data.split("\n")) line(w, l)
           return
         }
-        const mine = stop.filter((id) => watches.has(id))
-        if (mine.length === 0) return
-        try {
-          const raw = JSON.parse(await readFile(BG_REQUESTS_FILE, "utf8")) as { stop?: string[]; backgroundSessions?: string[] }
-          await writeFile(
-            BG_REQUESTS_FILE,
-            JSON.stringify({ stop: (raw.stop ?? []).filter((id) => !watches.has(id)), backgroundSessions: raw.backgroundSessions ?? [] }),
-          )
-        } catch {
-          /* racing writer — worst case the stop is processed twice, which is harmless */
+        const size = data instanceof ArrayBuffer ? data.byteLength : data instanceof Uint8Array ? data.byteLength : 0
+        if (size > MAX_WS_FRAME) {
+          end(w, `frame too large (${size} bytes > 1MiB)`)
+          return
         }
-        for (const id of mine) stopOne(id)
-      })()
-    }, 1000)
-    requestPoller.unref?.()
-  }
-  ensureRequestPoller()
+        line(w, `[binary frame, ${size} bytes]`)
+      })
+      sock.addEventListener("close", (ev) => {
+        if (!w.ended) end(w, `socket closed (code ${ev.code ?? "unknown"})`)
+      })
+      sock.addEventListener("error", () => {
+        if (!w.ended) end(w, "socket error")
+      })
+      return undefined
+    }
 
-  return {
-    "experimental.chat.system.transform": async (_input, output) => {
+    async function start(args: {
+      description: string
+      command?: string
+      ws_url?: string
+      ws_protocols?: string
+      pattern?: string
+      timeout_ms?: number
+      persistent?: boolean
+    }, sessionID: string): Promise<string> {
+      if (!args.command && !args.ws_url) return "provide either `command` or `ws_url`"
+      if (args.command && args.ws_url) return "provide only one of `command` or `ws_url`"
+      let pattern: RegExp | undefined
+      if (args.pattern) {
+        try {
+          pattern = new RegExp(args.pattern)
+        } catch (e) {
+          return `invalid pattern: ${e}`
+        }
+      }
+      const id = "m" + randomBytes(3).toString("hex")
+      const timeout = args.persistent ? Infinity : Math.max(1000, args.timeout_ms ?? DEFAULT_TIMEOUT_MS)
+      const w: Watch = {
+        id,
+        description: args.description || args.command || args.ws_url || "watch",
+        sessionID,
+        directory,
+        source: args.ws_url ? "ws" : "command",
+        target: args.command ?? args.ws_url ?? "",
+        pattern,
+        startedAt: Date.now(),
+        timeoutAt: timeout === Infinity ? Infinity : Date.now() + timeout,
+        events: 0,
+        buffered: [],
+        ended: false,
+      }
+
+      let err: string | undefined
+      if (args.ws_url) {
+        const protocols = (args.ws_protocols ?? "").split(",").map((s) => s.trim()).filter(Boolean)
+        err = await startWebSocket(id, w, args.ws_url, protocols)
+      } else {
+        err = startCommand(id, w, args.command as string)
+      }
+      if (err) {
+        w.ended = true
+        return err
+      }
+
+      watches.set(id, w)
+      persist(watches)
+      void publishSnapshot(w)
+
+      if (timeout !== Infinity) {
+        setTimeout(() => end(w, "timeout reached"), timeout).unref?.()
+      }
+      return [
+        `Watching (${id}): ${w.description}`,
+        args.ws_url ? `WebSocket feed: ${args.ws_url}` : `Command: ${args.command}`,
+        timeout === Infinity ? "Runs until monitor_stop or session end." : `Ends automatically at ${new Date(w.timeoutAt).toLocaleTimeString()} unless persistent.`,
+        `Each ${args.ws_url ? "message" : "output line"} arrives as an [monitor …] event message${pattern ? ` (filtered by /${args.pattern}/)` : ""} — react when they arrive, keep working otherwise.`,
+        `Stop with monitor_stop (id: ${id}).`,
+      ].join("\n")
+    }
+
+    function stopOne(id: string): string {
+      const w = watches.get(id)
+      if (!w) return `no active watch '${id}' (active: ${[...watches.keys()].join(", ") || "none"})`
+      end(w, "stopped by monitor_stop")
+      return `stopped ${id}`
+    }
+
+    // Consume stop requests from the shared requests file that target OUR watch
+    // ids, leaving entries owned by other plugins (e.g. background tasks).
+    let requestPoller: ReturnType<typeof setInterval> | undefined
+    function ensureRequestPoller() {
+      if (requestPoller) return
+      requestPoller = setInterval(() => {
+        void (async () => {
+          let stop: string[] = []
+          try {
+            const raw = JSON.parse(await readFile(BG_REQUESTS_FILE, "utf8")) as { stop?: string[] }
+            stop = raw.stop ?? []
+          } catch {
+            return
+          }
+          const mine = stop.filter((id) => watches.has(id))
+          if (mine.length === 0) return
+          try {
+            const raw = JSON.parse(await readFile(BG_REQUESTS_FILE, "utf8")) as { stop?: string[]; backgroundSessions?: string[] }
+            await writeFile(
+              BG_REQUESTS_FILE,
+              JSON.stringify({ stop: (raw.stop ?? []).filter((id) => !watches.has(id)), backgroundSessions: raw.backgroundSessions ?? [] }),
+            )
+          } catch {
+            /* racing writer — worst case the stop is processed twice, which is harmless */
+          }
+          for (const id of mine) stopOne(id)
+        })()
+      }, 1000)
+      requestPoller.unref?.()
+    }
+    ensureRequestPoller()
+
+    // Was V1's `experimental.chat.system.transform`: the guidance goes into the
+    // system prompt of every request, once.
+    await ctx.session.hook("context", (c) => {
       try {
-        if (output.system.includes(MONITOR_SYSTEM_PROMPT)) return
-        output.system.push(MONITOR_SYSTEM_PROMPT)
+        if (c.system.some((p) => p.text === MONITOR_SYSTEM_PROMPT)) return
+        c.system.push({ type: "text", text: MONITOR_SYSTEM_PROMPT })
       } catch {}
-    },
-    tool: {
-      monitor: tool({
+    })
+
+    await ctx.tool.transform((t) => {
+      t.add({
+        name: "monitor",
         description: `Start a background watch and stream its output into this session as events, so you can react mid-conversation. Use it to tail logs and flag errors, poll CI/PR status until it changes, watch a directory via a script, or connect to a WebSocket feed. Provide either \`command\` (its stdout lines become events) or \`ws_url\`. The watch ends at the deadline unless persistent; deliver at most a bounded number of events, then it ends to protect context.
 
-This tool backs the /monitor command. Given a thing to watch, call it with a \`command\` that prints ONLY the interesting lines — filter inside the command with grep/Select-String/tail as appropriate — a short \`description\`, and a \`pattern\` when the user names a specific thing to match (e.g. READY, error). For polling (CI, PRs, URLs) write a loop command that prints one line per state change, not a line per poll. Prefer \`persistent\` only when the user asks for indefinite watching. With no argument at all, do not start anything: say you can list or stop watches, name the ids of any watch started this session, and ask what they want watched.
+  This tool backs the /monitor command. Given a thing to watch, call it with a \`command\` that prints ONLY the interesting lines — filter inside the command with grep/Select-String/tail as appropriate — a short \`description\`, and a \`pattern\` when the user names a specific thing to match (e.g. READY, error). For polling (CI, PRs, URLs) write a loop command that prints one line per state change, not a line per poll. Prefer \`persistent\` only when the user asks for indefinite watching. With no argument at all, do not start anything: say you can list or stop watches, name the ids of any watch started this session, and ask what they want watched.
 
-When \`[monitor …]\` event messages arrive later in the conversation, treat them as real events: report or act on them immediately, without re-running the watch command.`,
-        args: {
-          command: tool.schema.string().optional().describe("shell command to run in the background; each stdout line becomes an event, so make it print only what matters. Mutually exclusive with ws_url."),
-          ws_url: tool.schema.string().optional().describe("ws:// or wss:// URL; each text message becomes an event. Mutually exclusive with command."),
-          ws_protocols: tool.schema.string().optional().describe("comma-separated WebSocket subprotocols to offer"),
-          description: tool.schema.string().describe("short label shown in every event, e.g. 'dev server log' or 'CI status'"),
-          pattern: tool.schema.string().optional().describe("optional regex; only lines matching it are forwarded (saves tokens on noisy output)"),
-          timeout_ms: tool.schema.number().optional().describe("watch deadline; default 15 minutes"),
-          persistent: tool.schema.boolean().optional().describe("run until monitor_stop / session end, ignoring the deadline"),
+  When \`[monitor …]\` event messages arrive later in the conversation, treat them as real events: report or act on them immediately, without re-running the watch command.`,
+        input: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "shell command to run in the background; each stdout line becomes an event, so make it print only what matters. Mutually exclusive with ws_url." },
+            ws_url: { type: "string", description: "ws:// or wss:// URL; each text message becomes an event. Mutually exclusive with command." },
+            ws_protocols: { type: "string", description: "comma-separated WebSocket subprotocols to offer" },
+            description: { type: "string", description: "short label shown in every event, e.g. 'dev server log' or 'CI status'" },
+            pattern: { type: "string", description: "optional regex; only lines matching it are forwarded (saves tokens on noisy output)" },
+            timeout_ms: { type: "number", description: "watch deadline; default 15 minutes" },
+            persistent: { type: "boolean", description: "run until monitor_stop / session end, ignoring the deadline" },
+          },
+          required: ["description"],
         },
-        async execute(args, context) {
-          return start(args, context.sessionID)
+        async execute(input, context) {
+          return { content: await start(input as MonitorArgs, context.sessionID) }
         },
-      }),
+      })
 
-      monitor_stop: tool({
+      t.add({
+        name: "monitor_stop",
         description: `Cancel one background watch started with the monitor tool, or all of them. Watches also end on their deadline, when their command exits, or when the session ends.
 
-This is the /monitor branch for the argument words "stop", "off" and "cancel": pass the id given in the arguments, or \`all\` when none is given.`,
-        args: {
-          id: tool.schema.string().optional().describe("watch id from the monitor result; omit or use 'all' to stop every active watch"),
+  This is the /monitor branch for the argument words "stop", "off" and "cancel": pass the id given in the arguments, or \`all\` when none is given.`,
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "watch id from the monitor result; omit or use 'all' to stop every active watch" },
+          },
         },
-        async execute(args) {
+        async execute(input) {
+          const args = input as MonitorStopArgs
           if (!args.id || args.id === "all") {
             const ids = [...watches.keys()]
             ids.forEach(stopOne)
-            return ids.length ? `stopped ${ids.length} watch(es): ${ids.join(", ")}` : "no active watches"
+            return { content: ids.length ? `stopped ${ids.length} watch(es): ${ids.join(", ")}` : "no active watches" }
           }
-          return stopOne(args.id)
+          return { content: stopOne(args.id) }
         },
-      }),
-    },
-    event: async ({ event }) => {
-      // A session ending takes its watches with it (Claude Code parity).
-      if (event.type === "session.deleted") {
-        const sid = (event.properties as { sessionID?: string } | undefined)?.sessionID
-        for (const w of [...watches.values()]) {
-          if (w.sessionID === sid) end(w, "session ended")
+      })
+    })
+
+    // A session ending takes its watches with it (Claude Code parity). Was V1's
+    // `event` hook; V2 streams events through ctx.event.subscribe.
+    const events = new AbortController()
+    void (async () => {
+      try {
+        for await (const e of ctx.event.subscribe({ types: ["session.deleted"], signal: events.signal })) {
+          if (e.type !== "session.deleted") continue
+          const sid = e.data.sessionID
+          for (const w of [...watches.values()]) {
+            if (w.sessionID === sid) end(w, "session ended")
+          }
         }
+      } catch {
+        /* stream closed on unload */
       }
-    },
-    async dispose() {
+    })()
+
+    // Was V1's `dispose`.
+    return async () => {
+      events.abort()
       if (requestPoller) clearInterval(requestPoller)
       for (const w of [...watches.values()]) end(w, "session ended")
-    },
-  }
-}
+    }
+  },
+})
