@@ -511,12 +511,16 @@ export default Plugin.define({
 		})
 
 		await ctx.tool.transform((t) => {
-			// Replaces opencode's built-in bash: identical UX for short commands,
+			// Replaces opencode's built-in shell: identical UX for short commands,
 			// but ctrl+b can move a long-running command to the background and
-			// free the conversation while it finishes. (opencode 2.3's own shell
-			// tool is called `shell`, so this `bash` now sits beside it.)
+			// free the conversation while it finishes. opencode 2.3 calls its own
+			// shell tool `shell`, so it is removed here, leaving the model one
+			// shell tool; `bash` takes its place as a top-level tool (the built-in
+			// is not in code mode either) under the name the guidance uses.
+			t.remove("shell")
 			t.add({
 				name: "bash",
+				options: { codemode: false },
 				description:
 					"Run a shell command and return its output. While a command is running, the user can press ctrl+b in the TUI to move it to the background; " +
 					"the tool then returns immediately with a task ID and the conversation continues — you will receive a message with the command's result when it finishes. " +
