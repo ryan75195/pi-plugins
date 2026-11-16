@@ -4,7 +4,8 @@
  * Renders a compact "Remote Control" section in the TUI sidebar (the panel on
  * the right, toggled with ctrl+x b). Pairs with the server-side plugin
  * opencode/plugins/remote-control.ts, which publishes one registration per
- * live instance — including a live client count — to a shared JSON file:
+ * directory it serves (keyed by pid + directory) — including a live client
+ * count — to a shared JSON file:
  *
  *   off:        ○ Remote Control  off · /remote-control to connect
  *   registered: ● Remote Control  on
@@ -93,19 +94,22 @@ export default Plugin.define({
 		const tickTimer = setInterval(() => setNow(Date.now()), TICK_MS)
 		void poll()
 
-		// The server plugin lives in the opencode server process, which is a
-		// different pid from this TUI (in opencode 2.3 usually the background
-		// service) — hence the directory fallback: the session's own directory,
-		// then the TUI's location, then its working directory.
+		// Registrations are per directory (pid + directory): in opencode 2.3 one
+		// server process — usually the background service, not this TUI — hosts
+		// every directory, so the pid says nothing about which one is this
+		// session's. Match the session's own directory; only when that is unknown
+		// fall back to the TUI's location, then its working directory. A session
+		// in a directory with no registration is "off", whatever else is on.
 		function mine(sessionID: string): Registration | undefined {
 			const regs = registrations()
-			const byPid = regs.find((r) => r.pid === process.pid)
-			if (byPid) return byPid
-			const dirs = [ctx.data.session.get(sessionID)?.location?.directory, ctx.location?.directory, cwd].filter(
+			const sessionDir = ctx.data.session.get(sessionID)?.location?.directory
+			const dirs = (sessionDir ? [sessionDir] : [ctx.location?.directory, cwd]).filter(
 				(d): d is string => typeof d === "string" && d.length > 0,
 			)
 			for (const dir of dirs) {
-				const match = regs.find((r) => samePath(r.directory, dir))
+				const matches = regs.filter((r) => typeof r.directory === "string" && samePath(r.directory, dir))
+				// Two processes can each register one directory: prefer this TUI's own.
+				const match = matches.find((r) => r.pid === process.pid) ?? matches[0]
 				if (match) return match
 			}
 			return undefined
