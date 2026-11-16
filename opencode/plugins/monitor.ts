@@ -187,6 +187,45 @@ interface MonitorStopArgs {
   id?: string
 }
 
+const RESUBSCRIBE_MIN_MS = 250
+const RESUBSCRIBE_MAX_MS = 10_000
+
+/**
+ * Feeds every event of `subscribe()` to `onEvent` for as long as the plugin is
+ * loaded. A stream that ends or throws is reopened after a short backoff
+ * (doubling to a cap, reset once events flow again) instead of leaving the
+ * plugin deaf for good; aborting `signal` (the plugin's unload) stops it. A
+ * failing handler costs that one event, not the subscription.
+ */
+async function followEvents<E>(
+  signal: AbortSignal,
+  subscribe: () => AsyncIterable<E>,
+  onEvent: (event: E) => void | Promise<void>,
+  onError: (error: unknown) => void = () => {},
+): Promise<void> {
+  let delay = RESUBSCRIBE_MIN_MS
+  while (!signal.aborted) {
+    try {
+      for await (const event of subscribe()) {
+        delay = RESUBSCRIBE_MIN_MS
+        try {
+          await onEvent(event)
+        } catch (error) {
+          onError(error)
+        }
+      }
+    } catch (error) {
+      if (!signal.aborted) onError(error)
+    }
+    if (signal.aborted) return
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, delay)
+      signal.addEventListener("abort", () => (clearTimeout(timer), resolve()), { once: true })
+    })
+    delay = Math.min(delay * 2, RESUBSCRIBE_MAX_MS)
+  }
+}
+
 export default Plugin.define({
   id: "monitor",
   async setup(ctx) {
@@ -487,19 +526,17 @@ export default Plugin.define({
     // A session ending takes its watches with it (Claude Code parity). Was V1's
     // `event` hook; V2 streams events through ctx.event.subscribe.
     const events = new AbortController()
-    void (async () => {
-      try {
-        for await (const e of ctx.event.subscribe({ types: ["session.deleted"], signal: events.signal })) {
-          if (e.type !== "session.deleted") continue
-          const sid = e.data.sessionID
-          for (const w of [...watches.values()]) {
-            if (w.sessionID === sid) end(w, "session ended")
-          }
+    void followEvents(
+      events.signal,
+      () => ctx.event.subscribe({ types: ["session.deleted"], signal: events.signal }),
+      (e) => {
+        if (e.type !== "session.deleted") return
+        const sid = e.data.sessionID
+        for (const w of [...watches.values()]) {
+          if (w.sessionID === sid) end(w, "session ended")
         }
-      } catch {
-        /* stream closed on unload */
-      }
-    })()
+      },
+    )
 
     // Was V1's `dispose`.
     return async () => {

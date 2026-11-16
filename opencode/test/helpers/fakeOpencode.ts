@@ -24,7 +24,13 @@ export type FakeMessage =
     }
   | { id: string; type: "agent-switched"; time: { created: number }; agent: string }
 
-type V2Session = { id: string; projectID: string; title: string; time: { created: number; updated: number } }
+type V2Session = {
+  id: string
+  projectID: string
+  title: string
+  time: { created: number; updated: number }
+  location: { directory: string }
+}
 
 export type FakeOpencode = {
   ctx: Record<string, unknown>
@@ -43,6 +49,10 @@ export type FakeOpencode = {
   switches: Array<{ sessionID: string; agent?: string; model?: unknown }>
   permissionReplies: Array<{ sessionID: string; requestID: string; decision: string }>
   emit: (event: FakeEvent) => void
+  /** End the open event stream(s), as a host restart or a dropped stream would. */
+  endStreams: () => void
+  /** How many times the plugin has subscribed to events. */
+  subscriptions: () => number
 }
 
 class NotFound extends Error {
@@ -57,7 +67,8 @@ class NotFound extends Error {
 
 export function createFakeOpencode(options: {
   directory: string
-  sessions?: Array<{ id: string; title: string }>
+  /** `directory` places a session in another directory (the host knows it by id, but it isn't this instance's). */
+  sessions?: Array<{ id: string; title: string; directory?: string }>
   messages?: Record<string, FakeMessage[]>
 }): FakeOpencode {
   const { directory } = options
@@ -75,13 +86,21 @@ export function createFakeOpencode(options: {
   let createCounter = 0
 
   for (const s of options.sessions ?? []) {
-    sessions.set(s.id, { id: s.id, projectID: "contract", title: s.title, time: { created: clock, updated: clock++ } })
+    sessions.set(s.id, {
+      id: s.id,
+      projectID: "contract",
+      title: s.title,
+      time: { created: clock, updated: clock++ },
+      location: { directory: s.directory ?? directory },
+    })
   }
   for (const [id, rows] of Object.entries(options.messages ?? {})) messages.set(id, rows)
 
   // The event channel: emitted events queue until the plugin's subscription pulls them.
   const queue: FakeEvent[] = []
   let wake: (() => void) | undefined
+  let generation = 0
+  let subscribeCalls = 0
   const emit = (event: FakeEvent) => {
     queue.push(event)
     wake?.()
@@ -105,7 +124,12 @@ export function createFakeOpencode(options: {
       list: async (input: { directory?: string; cursor?: string }) => {
         call("session.list")
         if (input?.directory !== directory) throw new Error(`fake opencode: expected directory=${directory}`)
-        return { data: Array.from(sessions.values()).map((s) => structuredClone(s)), cursor: {} }
+        return {
+          data: Array.from(sessions.values())
+            .filter((s) => s.location.directory === directory)
+            .map((s) => structuredClone(s)),
+          cursor: {},
+        }
       },
       get: async (input: { sessionID: string }) => {
         call("session.get")
@@ -119,6 +143,7 @@ export function createFakeOpencode(options: {
           projectID: "contract",
           title: input.title ?? "",
           time: { created: clock, updated: clock++ },
+          location: { directory },
         }
         sessions.set(created.id, created)
         return structuredClone(created)
@@ -241,10 +266,13 @@ export function createFakeOpencode(options: {
       },
     },
     event: {
-      subscribe: (opts?: { signal?: AbortSignal }) => ({
+      subscribe: (opts?: { signal?: AbortSignal }) => {
+        subscribeCalls++
+        const born = generation
+        return {
         async *[Symbol.asyncIterator]() {
           for (;;) {
-            if (opts?.signal?.aborted) return
+            if (opts?.signal?.aborted || generation !== born) return
             const next = queue.shift()
             if (next) {
               yield { id: `evt_${clock++}`, created: clock, ...next }
@@ -257,7 +285,8 @@ export function createFakeOpencode(options: {
             wake = undefined
           }
         },
-      }),
+        }
+      },
     },
   }
 
@@ -276,5 +305,10 @@ export function createFakeOpencode(options: {
     switches,
     permissionReplies,
     emit,
+    endStreams: () => {
+      generation++
+      wake?.()
+    },
+    subscriptions: () => subscribeCalls,
   }
 }

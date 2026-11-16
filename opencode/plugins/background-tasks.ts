@@ -23,7 +23,7 @@
 
 import { Plugin } from "@opencode/plugin"
 import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process"
-import { createWriteStream, existsSync } from "node:fs"
+import { createWriteStream, existsSync, mkdirSync } from "node:fs"
 import { mkdir, open, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, basename } from "node:path"
@@ -102,17 +102,61 @@ function snapshot(t: BgTask): TaskSnapshot {
 	}
 }
 
-async function persistState(tasks: Map<string, BgTask>) {
-	// Sidebar state: only explicitly-background tasks (and foreground ones the
-	// user moved to the background with ctrl+b). Blocking foreground commands
-	// stay off the sidebar until they are backgrounded or finish; finished
-	// background tasks linger briefly.
-	const now = Date.now()
-	const visible = [...tasks.values()].filter((t) => {
-		if (t.foreground && !t.backgrounded) return false
-		return t.status === "running" || !t.finishedAt || now - t.finishedAt < SIDEBAR_FINISHED_LINGER_MS
-	})
-	await persistStateMap(new Map(visible.map((t) => [t.id, snapshot(t) as unknown as BgTask])))
+function lingers(t: { status: TaskStatus; finishedAt?: number }, now: number): boolean {
+	return t.status === "running" || !t.finishedAt || now - t.finishedAt < SIDEBAR_FINISHED_LINGER_MS
+}
+
+function pidAlive(pid: number | undefined): boolean {
+	if (!pid) return false
+	try {
+		process.kill(pid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
+// Writes from every directory's setup in this process go one at a time, so one
+// read-merge-write never interleaves with another and drops its rows.
+let stateWrites: Promise<void> = Promise.resolve()
+
+/**
+ * Publish this setup's tasks to the state file the TUI reads, merged with the
+ * rows other writers own: opencode 2.3 runs one setup per directory in the same
+ * process (and other opencode processes share the file), so a write must never
+ * replace their rows with only ours.
+ *
+ * Shown: explicitly-background tasks and foreground ones the user moved to the
+ * background with ctrl+b (finished ones linger briefly), plus RUNNING foreground
+ * commands that are still blocking — the TUI's ctrl+b and its hint act on those
+ * rows (foreground, not backgrounded, running, live pid) and its sidebar leaves
+ * them out. A foreground command that finished while blocking returned its
+ * output to the model and is dropped.
+ *
+ * `owned` is every id this setup ever published, so its stopped/removed tasks
+ * leave the file instead of being kept as someone else's.
+ */
+function persistState(tasks: Map<string, BgTask>, owned: Set<string>): Promise<void> {
+	const run = async () => {
+		const now = Date.now()
+		const visible = [...tasks.values()].filter((t) => {
+			if (t.foreground && !t.backgrounded) return t.status === "running"
+			return lingers(t, now)
+		})
+		for (const t of visible) owned.add(t.id)
+		let others: TaskSnapshot[] = []
+		try {
+			const raw = JSON.parse(await readFile(STATE_FILE, "utf8")) as { tasks?: TaskSnapshot[] }
+			others = (raw.tasks ?? []).filter(
+				(t) => !owned.has(t.id) && lingers(t, now) && (t.status !== "running" || pidAlive(t.pid)),
+			)
+		} catch {
+			// no state yet, or unreadable: ours is all there is
+		}
+		await persistStateMap(new Map([...others.map((t) => [t.id, t] as const), ...visible.map((t) => [t.id, snapshot(t)] as const)]))
+	}
+	stateWrites = stateWrites.then(run, run)
+	return stateWrites
 }
 
 async function persistStateMap(snapshots: Map<string, unknown>) {
@@ -182,6 +226,8 @@ export default Plugin.define({
 	async setup(ctx) {
 		const directory: string = ctx.location.directory
 		const tasks = new Map<string, BgTask>()
+		// Every task id this setup has written to the shared state file.
+		const published = new Set<string>()
 
 		function running(): BgTask[] {
 			return [...tasks.values()].filter((t) => t.status === "running")
@@ -261,13 +307,18 @@ export default Plugin.define({
 						return
 					}
 					if (ids.length === 0 && backgroundSessions.length === 0) return
-					// Consume only OUR stop ids; leave foreign ones (e.g. monitor watch
-					// ids) for whichever plugin owns them.
+					// Consume only OUR stop ids and sessions; leave foreign ones (e.g.
+					// monitor watch ids, or another directory's sessions — one opencode
+					// process hosts several) for whichever setup owns them.
 					const mine = ids.filter((id) => tasks.has(id))
 					const theirs = ids.filter((id) => !tasks.has(id))
-					if (mine.length === 0 && backgroundSessions.length === 0) return
+					const ownSession = (sid: string) => [...tasks.values()].some((t) => t.sessionID === sid)
+					const mySessions = backgroundSessions.filter(ownSession)
+					const theirSessions = backgroundSessions.filter((sid) => !ownSession(sid))
+					if (mine.length === 0 && mySessions.length === 0) return
+					backgroundSessions = mySessions
 					try {
-						await writeFile(REQUESTS_FILE, JSON.stringify({ stop: theirs, backgroundSessions: [] }))
+						await writeFile(REQUESTS_FILE, JSON.stringify({ stop: theirs, backgroundSessions: theirSessions }))
 					} catch {
 						// ignore
 					}
@@ -284,7 +335,7 @@ export default Plugin.define({
 						for (const t of tasks.values()) {
 							if (t.sessionID === sid && t.foreground && !t.backgrounded && t.status === "running") {
 								t.backgrounded = true
-								void persistState(tasks)
+								void persistState(tasks, published)
 							}
 						}
 					}
@@ -308,6 +359,9 @@ export default Plugin.define({
 			opts?: { foreground?: boolean; shell?: { file: string; args: string[] } },
 		): BgTask {
 			const id = randomUUID().slice(0, 8)
+			// The foreground `bash` can be the first thing to run on a fresh machine,
+			// before anything else has made the folder for the output file.
+			mkdirSync(OUTPUT_DIR, { recursive: true })
 			const outputFile = join(OUTPUT_DIR, `${id}.log`)
 			const child = opts?.shell
 				? spawn(opts.shell.file, opts.shell.args, {
@@ -343,7 +397,7 @@ export default Plugin.define({
 			}
 			tasks.set(id, task)
 			ensureRequestPoller()
-			void persistState(tasks)
+			void persistState(tasks, published)
 
 			let bytes = 0
 			const out = createWriteStream(outputFile, { flags: "a" })
@@ -383,7 +437,7 @@ export default Plugin.define({
 				task.waiters = []
 				// Stopped tasks are removed entirely so they drop out of the UI.
 				if (task.status === "stopped") tasks.delete(task.id)
-				void persistState(tasks)
+				void persistState(tasks, published)
 				stopRequestPollerIfIdle()
 			})
 
@@ -397,7 +451,7 @@ export default Plugin.define({
 					void notifyCompletion(task)
 					for (const w of task.waiters) w()
 					task.waiters = []
-					void persistState(tasks)
+					void persistState(tasks, published)
 				}
 			})
 
@@ -520,7 +574,10 @@ export default Plugin.define({
 			t.remove("shell")
 			t.add({
 				name: "bash",
-				options: { codemode: false },
+				// `permission` names the action the agent's permission rules are
+				// checked against when the tool list is built: an agent that denies
+				// `shell` doesn't get this bash either, as it didn't get the built-in.
+				options: { codemode: false, permission: "shell" },
 				description:
 					"Run a shell command and return its output. While a command is running, the user can press ctrl+b in the TUI to move it to the background; " +
 					"the tool then returns immediately with a task ID and the conversation continues — you will receive a message with the command's result when it finishes. " +
@@ -553,7 +610,7 @@ export default Plugin.define({
 					const finishStopped = async (reason: string) => {
 						await waitFor(task, 5_000)
 						tasks.delete(task.id)
-						await persistState(tasks)
+						await persistState(tasks, published)
 						stopRequestPollerIfIdle()
 						const out = await tailOfFile(task.outputFile, 16_000)
 						const body = out.text.trim()
@@ -727,14 +784,9 @@ export default Plugin.define({
 			for (const t of running()) {
 				void stopTask(t)
 			}
-			const ourIds = new Set(tasks.keys())
+			for (const id of tasks.keys()) published.add(id)
 			tasks.clear()
-			try {
-				const raw = JSON.parse(await readFile(STATE_FILE, "utf8")) as { tasks?: TaskSnapshot[] }
-				await persistStateMap(new Map((raw.tasks ?? []).filter((t) => !ourIds.has(t.id)).map((t) => [t.id, { ...t } as unknown as BgTask])))
-			} catch {
-				await persistState(tasks)
-			}
+			await persistState(tasks, published)
 		}
 	},
 })

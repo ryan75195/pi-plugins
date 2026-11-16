@@ -12,6 +12,9 @@ export async function loadModule(): Promise<RemoteControlModule> {
     const sandbox = mkdtempSync(join(tmpdir(), "remote-control-contract-"))
     process.env.TEMP = sandbox
     process.env.HOME = join(sandbox, "home")
+    // Node reads the home directory from USERPROFILE on Windows: without this the
+    // machine pairing and resume files would be the real ones under ~/.config.
+    process.env.USERPROFILE = process.env.HOME
     mkdirSync(process.env.HOME, { recursive: true })
     modulePromise = import("../../plugins/remote-control.ts")
   }
@@ -35,7 +38,7 @@ export type TestInstance = {
  */
 export async function openTestInstance(
   seed: {
-    sessions?: Array<{ id: string; title: string }>
+    sessions?: Array<{ id: string; title: string; directory?: string }>
     messages?: Record<string, FakeMessage[]>
   } = {},
   options: { disconnect?: () => void } = {},
