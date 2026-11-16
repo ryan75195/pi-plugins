@@ -118,7 +118,8 @@ async function publishSnapshot(w: Watch) {
     } catch {
       /* no registry yet */
     }
-    if (!w.ended || w.events >= 0) tasks.push(row) // always publish; sidebar prunes ended rows itself    mkdirSync(BG_DIR, { recursive: true })
+    if (!w.ended || w.events >= 0) tasks.push(row) // always publish; sidebar prunes ended rows itself
+    mkdirSync(BG_DIR, { recursive: true })
     writeFileSync(BG_STATE_FILE, JSON.stringify({ updatedAt: Date.now(), tasks }))
   } catch {
     /* best effort */
