@@ -10,5 +10,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["*/tui.tsx"]
+  "include": ["*/tui.tsx", "check-load.ts"]
 }

@@ -19,10 +19,18 @@
  *   BUN_BE_BUN=1 opencode run --preload ./node_modules/@opentui/solid/scripts/preload.js check-load.ts
  *   # or, with Bun installed: npm run check:load
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+
+// opencode's binary runs this as Bun; the few Bun APIs used here, for the typecheck.
+declare const Bun: {
+	spawnSync(cmd: string[], options: { env: Record<string, string | undefined>; stdout: "inherit"; stderr: "inherit" }): { exitCode: number | null }
+	spawn(cmd: string[], options: { stdout: "ignore" }): { pid: number; kill(): void }
+	resolveSync(specifier: string, from: string): string
+	sleep(ms: number): Promise<void>
+}
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PRELOAD = join(HERE, "node_modules", "@opentui", "solid", "scripts", "preload.js")
@@ -38,7 +46,7 @@ if (!process.env.TUI_CHECK_TEMP) {
 	process.exit(child.exitCode ?? 1)
 }
 
-const T = process.env.TUI_CHECK_TEMP
+const T: string = process.env.TUI_CHECK_TEMP
 if (tmpdir() !== T) throw new Error(`tmpdir() is ${tmpdir()}, expected the private ${T}`)
 
 const load = (name: string) => import(Bun.resolveSync(name, HERE))
@@ -70,13 +78,17 @@ const write = (dir: string, data: unknown) => {
 	mkdirSync(join(T, dir), { recursive: true })
 	writeFileSync(join(T, dir, "state.json"), JSON.stringify(data))
 }
-write("opencode-background-tasks", {
-	tasks: [
-		{ id: "bg-1", sessionID: "ses_A", command: "npm run dev", description: "dev server", pid: process.pid, startedAt: now - 72_000, exitCode: null, status: "running", outputFile: "a", truncated: false },
-		{ id: "bg-2", sessionID: "ses_A", command: "npm test", pid: 0, startedAt: now - 5000, finishedAt: now - 1000, exitCode: 1, status: "failed", outputFile: "b", truncated: false },
-		{ id: "bg-3", sessionID: "ses_A", command: "sleep 100", pid: process.pid, startedAt: now - 3000, exitCode: null, status: "running", outputFile: "c", truncated: false, foreground: true, backgrounded: false },
-	],
-})
+// Rows in the shape the server plugin writes (snapshot() in
+// opencode/plugins/background-tasks.ts, after JSON drops undefined fields): two
+// bash_background tasks, and a blocking `bash` command (foreground, not yet
+// backgrounded), which the server now publishes so ctrl+b and the hint can act on it.
+const bgDir = join(T, "opencode-background-tasks")
+const blockingRow = { id: "bg-3", sessionID: "ses_A", command: "sleep 100", pid: server.pid, startedAt: now - 3000, exitCode: null, status: "running", outputFile: join(bgDir, "bg-3.log"), truncated: false, foreground: true, backgrounded: false }
+const bgRows = [
+	{ id: "bg-1", sessionID: "ses_A", command: "npm run dev", description: "dev server", pid: server.pid, startedAt: now - 72_000, exitCode: null, status: "running", outputFile: join(bgDir, "bg-1.log"), truncated: false, foreground: false, backgrounded: false },
+	{ id: "bg-2", sessionID: "ses_A", command: "npm test", pid: 0, startedAt: now - 5000, finishedAt: now - 1000, exitCode: 1, status: "failed", outputFile: join(bgDir, "bg-2.log"), truncated: false, foreground: false, backgrounded: false },
+]
+write("opencode-background-tasks", { updatedAt: now, tasks: [...bgRows, blockingRow] })
 // goal-loop (opencode-architect) keeps one file per session: <repoKey>.<sessionID>.json,
 // plus a .spent.json ledger the sidebar must ignore.
 const goalDir = process.env.OPENCODE_GOAL_STATE_DIR!
@@ -86,13 +98,33 @@ writeFileSync(
 	JSON.stringify({ kind: "goal", text: "all tests pass", intervalMs: null, until: null, status: "active", turns: 3, maxTurns: 50, startedAt: now - 30_000, expiresAt: now + 3_600_000, lastReason: "2 tests still failing", stalledTurns: 0, agent: "build" }),
 )
 writeFileSync(join(goalDir, "0123456789ab.ses_A.spent.json"), JSON.stringify({ turns: 7 }))
+// A goal paused a minute after it started, two minutes ago: its clock stops at the
+// pause (the file's last write), it does not keep counting.
+const pausedGoal = join(goalDir, "0123456789ab.ses_P.json")
+writeFileSync(
+	pausedGoal,
+	JSON.stringify({ kind: "goal", text: "paused goal", intervalMs: null, until: null, status: "paused", turns: 1, maxTurns: 50, startedAt: now - 180_000, expiresAt: now + 3_600_000, lastReason: "", stalledTurns: 0, agent: "build" }),
+)
+utimesSync(pausedGoal, new Date(now - 120_000), new Date(now - 120_000))
 // The older goal plugin's shared file: an older run for the same session, which must lose.
 write("opencode-goal", {
 	goals: [{ sessionID: "ses_A", condition: "stale legacy goal", startedAt: now - 900_000, turns: 9, status: "paused" }],
 })
+// One server process, two directories (pid + directory registrations): the
+// project ses_A lives in, and the TUI's own location.
 write("opencode-remote", {
-	registrations: [{ id: "x", mount: "/rc-5e34d34d7587", name: "n", directory: project, startedAt: now - 60_000, pid: server.pid, clients: 1 }],
+	registrations: [
+		{ id: "x", mount: "/rc-5e34d34d7587", name: "n", directory: project, startedAt: now - 60_000, pid: server.pid, clients: 1 },
+		{ id: "y", mount: "/rc-elsewhere00000", name: "e", directory: "/elsewhere", startedAt: now - 60_000, pid: server.pid, clients: 0 },
+	],
 })
+// Per session, what the remote-control section shows beyond ses_A: a session in a
+// directory with no registration is off (not the TUI location's registration), and
+// only a session whose directory is unknown falls back to the TUI's location.
+const remoteBySession: Record<string, { want: string; not?: string }> = {
+	ses_B: { want: "○ Remote Control off", not: "/rc-" },
+	ses_unknown: { want: "/rc-elsewhere00000" },
+}
 
 // What each plugin's sections must show for the sample state above.
 const expected: Record<string, string[]> = {
@@ -102,6 +134,7 @@ const expected: Record<string, string[]> = {
 }
 
 const toasts: Array<{ title?: string }> = []
+let route: { type: string; sessionID?: string } = { type: "session", sessionID: "ses_A" }
 let failures = 0
 const check = (ok: boolean, what: string) => {
 	console.log(`${ok ? "ok  " : "FAIL"} ${what}`)
@@ -124,7 +157,16 @@ for (const name of Object.keys(expected)) {
 		app: { version: "2.3.0", channel: "latest" },
 		theme,
 		themeMode: "dark",
-		data: { session: { get: (id: string) => (id === "ses_A" ? { id, location: { directory: project.replace(/\\/g, "/").toLowerCase() } } : undefined) } },
+		data: {
+			session: {
+				get: (id: string) =>
+					id === "ses_A"
+						? { id, location: { directory: project.replace(/\\/g, "/").toLowerCase() } }
+						: id === "ses_B"
+							? { id, location: { directory: "/not/registered" } }
+							: undefined,
+			},
+		},
 		keymap: { layer: (factory: (typeof layers)[number]) => layers.push(factory) },
 		ui: {
 			slot: (claim: (typeof claims)[number]) => {
@@ -135,7 +177,7 @@ for (const name of Object.keys(expected)) {
 			},
 			toast: { show: (o: { title?: string }) => toasts.push(o) },
 			dialog: { confirm: async () => true },
-			router: { current: () => ({ type: "session", sessionID: "ses_A" }) },
+			router: { current: (): { type: string; sessionID?: string } => route },
 		},
 	}
 	const cleanup = await def.setup(ctx)
@@ -152,7 +194,25 @@ for (const name of Object.keys(expected)) {
 		r.renderer.destroy()
 	}
 	for (const want of expected[name]) check(text.includes(want), `shows "${want}"`)
-	if (name === "goal-indicator") check(!text.includes("stale legacy goal"), "the newer goal-loop run wins over the older legacy entry")
+	if (name === "remote-control-sidebar") {
+		for (const [sessionID, { want, not }] of Object.entries(remoteBySession)) {
+			const slot = claims.find((claim) => claim.append === "sidebar.content")!
+			const r = await testRender(() => slot.render({ sessionID }), { width: 70, height: 6 })
+			await r.renderOnce()
+			const frame = (r.captureCharFrame() as string).split("\n").map((l) => l.trim()).filter(Boolean).join(" ")
+			r.renderer.destroy()
+			check(frame.includes(want) && (!not || !frame.includes(not)), `${sessionID} shows "${want}" (${frame})`)
+		}
+	}
+	if (name === "goal-indicator") {
+		check(!text.includes("stale legacy goal"), "the newer goal-loop run wins over the older legacy entry")
+		const slot = claims.find((claim) => claim.append === "sidebar.content")!
+		const r = await testRender(() => slot.render({ sessionID: "ses_P" }), { width: 70, height: 6 })
+		await r.renderOnce()
+		const frame = (r.captureCharFrame() as string).split("\n").map((l) => l.trim()).filter(Boolean).join(" ")
+		r.renderer.destroy()
+		check(frame.includes("◎ Goal paused · 1m0s · 1 turn"), `a paused goal's clock stops at the pause (${frame})`)
+	}
 
 	for (const factory of layers) {
 		for (const cmd of factory().commands) {
@@ -161,6 +221,14 @@ for (const name of Object.keys(expected)) {
 			await Bun.sleep(200) // the request file is written asynchronously
 			const requests = JSON.parse(readFileSync(join(T, "opencode-background-tasks", "requests.json"), "utf8"))
 			check(requests.backgroundSessions?.includes("ses_A"), "ctrl+b wrote the background request for the session")
+
+			// Nothing of ours blocking: the key goes on to opencode's own ctrl+b.
+			route = { type: "home" }
+			check(cmd.run() === false, `${cmd.id} hands ctrl+b on (returns false) off a session`)
+			route = { type: "session", sessionID: "ses_A" }
+			write("opencode-background-tasks", { updatedAt: Date.now(), tasks: [...bgRows, { ...blockingRow, backgrounded: true }] })
+			await Bun.sleep(1000) // the plugin has re-read the state file
+			check(cmd.run() === false, `${cmd.id} hands ctrl+b on (returns false) once nothing of ours is blocking`)
 		}
 	}
 	if (typeof cleanup === "function") await cleanup()
