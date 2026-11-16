@@ -17,7 +17,7 @@
 import { Plugin } from "@opencode/plugin/tui"
 import type { RGBA } from "@opentui/core"
 import { createMemo, createSignal, Show } from "solid-js"
-import { readdir, readFile } from "node:fs/promises"
+import { readdir, readFile, stat } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -85,8 +85,13 @@ async function readGoalLoop(): Promise<GoalSnapshot[]> {
 		const match = GOAL_LOOP_FILE.exec(name)
 		if (!match) continue
 		try {
-			const state = JSON.parse(await readFile(join(dir, name), "utf8")) as GoalLoopState
+			const path = join(dir, name)
+			const state = JSON.parse(await readFile(path, "utf8")) as GoalLoopState
 			if ((state.kind !== "goal" && state.kind !== "loop") || typeof state.text !== "string") continue
+			// goal-loop's state has no "paused at"/"ended at" field, but it rewrites the
+			// file on every change, so the file's mtime is when the goal last changed:
+			// a paused, achieved or failed goal's clock stops there.
+			const endedAt = state.status === "active" ? undefined : (await stat(path)).mtimeMs
 			out.push({
 				sessionID: match[1],
 				label: state.kind === "loop" ? "Loop" : "Goal",
@@ -95,6 +100,7 @@ async function readGoalLoop(): Promise<GoalSnapshot[]> {
 				turns: state.turns ?? 0,
 				lastReason: state.lastReason || undefined,
 				status: state.status === "done" ? "achieved" : state.status,
+				...(endedAt !== undefined ? { endedAt } : {}),
 			})
 		} catch {
 			// a file mid-write or removed between readdir and read: next poll
@@ -119,8 +125,17 @@ export default Plugin.define({
 		const [goals, setGoals] = createSignal<GoalSnapshot[]>([])
 		const [now, setNow] = createSignal(Date.now())
 
+		// One read at a time: a slow poll finishing after a newer one must not
+		// put older state back.
+		let polling = false
 		const poll = async () => {
-			setGoals([...(await readGoalLoop()), ...(await readLegacy())])
+			if (polling) return
+			polling = true
+			try {
+				setGoals([...(await readGoalLoop()), ...(await readLegacy())])
+			} finally {
+				polling = false
+			}
 		}
 		const pollTimer = setInterval(poll, POLL_MS)
 		const tickTimer = setInterval(() => setNow(Date.now()), 1000)
