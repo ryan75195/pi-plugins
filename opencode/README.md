@@ -59,7 +59,6 @@ as first-class capabilities rather than as documentation it might have read:
 |---|---|
 | [plugins/background-tasks.ts](plugins/background-tasks.ts) | `Background tasks (plugin primitive)` — anything that keeps running goes through `bash_background`; completion arrives as a message, don't poll. |
 | [plugins/monitor.ts](plugins/monitor.ts) | `Monitor (plugin primitive)` — never sleep or poll in a loop; start a filtered `monitor` watch and act on `[monitor …]` events. |
-| [plugins/goal.ts](plugins/goal.ts) | `Goal (plugin primitive)` + `Loop (plugin primitive)` — a stated completion condition makes `goal_set` the first tool call; work until the evaluator says MET. A recurring task makes `loop` the first tool call; it re-runs its prompt on a cadence until `until` holds or the cap is reached, and `loop_stop` ends it. |
 | [plugins/remote-control.ts](plugins/remote-control.ts) | `Remote control (plugin primitive)` — what `remote_control` does, its actions, and reporting URLs verbatim. |
 
 Each push is guarded (skipped if the same section is already in `output.system`)
@@ -76,7 +75,7 @@ the opencode 2.3 TUI plugin API (`Plugin.define` from `@opencode/plugin/tui`):
 | Directory | Section |
 |---|---|
 | [tui/background-tasks-sidebar/](tui/background-tasks-sidebar/tui.tsx) | "Background tasks" — running/finished tasks, click-to-stop, ctrl+b hint |
-| [tui/goal-indicator/](tui/goal-indicator/tui.tsx) | "Goal" — live `/goal` (or `/loop`) condition, turns, last reason, from goal-loop's per-session state files |
+| [tui/goal-indicator/](tui/goal-indicator/tui.tsx) | "Goal" — live goal-loop `/goal` (or `/loop`) condition, turns, last reason, from goal-loop's per-session state files |
 | [tui/remote-control-sidebar/](tui/remote-control-sidebar/tui.tsx) | "Remote Control" — off / registered / clients connected |
 
 opencode 2.3 loads a local TUI plugin from a **directory** (it imports the
@@ -412,8 +411,7 @@ client) paints where a short user turn should be. Every command in
 /remote-control $ARGUMENTS — use the `remote_control` tool; report its output verbatim.
 ```
 
-The behaviour — argument-word mappings, the `/processes` table format, the
-`/goal` ordering rule, the `/monitor` guidance on filtered commands and
+The behaviour — argument-word mappings, the `/processes` table format, the `/monitor` guidance on filtered commands and
 `[monitor …]` events — lives in the `description` and arg `.describe()` text
 of the tools in `opencode/plugins/`, which the model sees on every turn:
 
@@ -422,7 +420,5 @@ of the tools in `opencode/plugins/`, which the model sees on every turn:
 | `/remote-control` | `remote_control` in [plugins/remote-control.ts](plugins/remote-control.ts) |
 | `/monitor` | `monitor`, `monitor_stop` in [plugins/monitor.ts](plugins/monitor.ts) |
 | `/processes` | `task_list`, `task_stop`, `task_output` in [plugins/background-tasks.ts](plugins/background-tasks.ts) |
-| `/goal` | `goal_set`, `goal_status`, `goal_clear` in [plugins/goal.ts](plugins/goal.ts) |
-| `/loop` | `loop`, `loop_stop` in [plugins/goal.ts](plugins/goal.ts) |
 
 Change a command's behaviour in the tool description, not the template.
