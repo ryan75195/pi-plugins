@@ -110,6 +110,45 @@ async function logFailure(sessionID: string, head: string, err: unknown): Promis
 	}
 }
 
+const RESUBSCRIBE_MIN_MS = 250
+const RESUBSCRIBE_MAX_MS = 10_000
+
+/**
+ * Feeds every event of `subscribe()` to `onEvent` for as long as the plugin is
+ * loaded. A stream that ends or throws is reopened after a short backoff
+ * (doubling to a cap, reset once events flow again) instead of leaving the
+ * plugin deaf for good; aborting `signal` (the plugin's unload) stops it. A
+ * failing handler costs that one event, not the subscription.
+ */
+async function followEvents<E>(
+	signal: AbortSignal,
+	subscribe: () => AsyncIterable<E>,
+	onEvent: (event: E) => void | Promise<void>,
+	onError: (error: unknown) => void = () => {},
+): Promise<void> {
+	let delay = RESUBSCRIBE_MIN_MS
+	while (!signal.aborted) {
+		try {
+			for await (const event of subscribe()) {
+				delay = RESUBSCRIBE_MIN_MS
+				try {
+					await onEvent(event)
+				} catch (error) {
+					onError(error)
+				}
+			}
+		} catch (error) {
+			if (!signal.aborted) onError(error)
+		}
+		if (signal.aborted) return
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, delay)
+			signal.addEventListener("abort", () => (clearTimeout(timer), resolve()), { once: true })
+		})
+		delay = Math.min(delay * 2, RESUBSCRIBE_MAX_MS)
+	}
+}
+
 export default Plugin.define({
 	id: "compaction-limit",
 	async setup(ctx) {
@@ -157,25 +196,25 @@ export default Plugin.define({
 		})
 
 		const abort = new AbortController()
-		void (async () => {
-			try {
-				for await (const event of ctx.event.subscribe({
+		void followEvents(
+			abort.signal,
+			() =>
+				ctx.event.subscribe({
 					types: ["session.compaction.started", "session.compaction.ended", "session.compaction.failed"],
 					signal: abort.signal,
-				})) {
-					if (event.type === "session.compaction.started") {
-						compactingSessions.add(event.data.sessionID)
-					} else if (event.type === "session.compaction.ended") {
-						compactingSessions.delete(event.data.sessionID)
-						lastHeadBySession.delete(event.data.sessionID)
-					} else if (event.type === "session.compaction.failed") {
-						compactingSessions.delete(event.data.sessionID)
-					}
+				}),
+			(event) => {
+				if (event.type === "session.compaction.started") {
+					compactingSessions.add(event.data.sessionID)
+				} else if (event.type === "session.compaction.ended") {
+					compactingSessions.delete(event.data.sessionID)
+					lastHeadBySession.delete(event.data.sessionID)
+				} else if (event.type === "session.compaction.failed") {
+					compactingSessions.delete(event.data.sessionID)
 				}
-			} catch (err) {
-				if (!abort.signal.aborted) void logFailure("-", "event-stream", err)
-			}
-		})()
+			},
+			(err) => void logFailure("-", "event-stream", err),
+		)
 
 		return () => abort.abort()
 	},

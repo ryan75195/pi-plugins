@@ -32,7 +32,8 @@ type FakeEvent = { type: string; data: { sessionID: string } }
 function eventStream() {
 	const queue: FakeEvent[] = []
 	let wake: (() => void) | undefined
-	let closed = false
+	// Bumped to end the subscriptions open now; a later subscribe gets a fresh stream.
+	let generation = 0
 	const subscriptions: Array<{ types?: readonly string[] }> = []
 	return {
 		subscriptions,
@@ -41,22 +42,24 @@ function eventStream() {
 			wake?.()
 		},
 		close() {
-			closed = true
+			generation++
 			wake?.()
 		},
 		subscribe(options?: { types?: readonly string[]; signal?: AbortSignal }) {
 			subscriptions.push({ types: options?.types })
+			const born = generation
+			let aborted = false
 			options?.signal?.addEventListener("abort", () => {
-				closed = true
+				aborted = true
 				wake?.()
 			})
 			return (async function* () {
 				while (true) {
-					while (queue.length > 0) {
+					while (queue.length > 0 && !aborted && generation === born) {
 						const event = queue.shift()!
 						if (!options?.types || options.types.includes(event.type)) yield event
 					}
-					if (closed) return
+					if (aborted || generation !== born) return
 					await new Promise<void>((resolve) => (wake = resolve))
 					wake = undefined
 				}
@@ -314,4 +317,21 @@ test("a persisted compactionLastHead survives a restart and is not recompacted",
 
 	await (await start(server)).fireIdle("s1")
 	assert.equal(server.compactCalls.length, 1, "a fresh plugin instance reads compactionLastHead from persisted metadata and does not recompact")
+})
+
+test("a dropped event stream is reopened, and unload stops it for good", async () => {
+	const server = makeServer({ metadata: { compactionLimit: 200_000 }, messages: [assistantMsg({ id: "m1", tokens: OVER })] })
+	const plugin = await start(server)
+	server.events.close()
+	const deadline = Date.now() + 5_000
+	while (server.events.subscriptions.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
+	assert.equal(server.events.subscriptions.length, 2, "it subscribed again")
+	await plugin.fireEvent("session.compaction.started", "s-after")
+	await plugin.fireIdle("s-after")
+	assert.equal(server.compactCalls.length, 0, "the reopened stream's compaction.started is seen")
+
+	await (plugin.cleanup as () => Promise<void> | void)()
+	server.events.close()
+	await new Promise((resolve) => setTimeout(resolve, 600))
+	assert.equal(server.events.subscriptions.length, 2, "no resubscribe after unload")
 })

@@ -33,6 +33,10 @@ export interface V2Harness {
 	cleanup: (() => Promise<void> | void) | undefined
 	/** Deliver an event to every active `event.subscribe` stream. */
 	emit(event: { type: string; data: Record<string, unknown> }): void
+	/** End every open `event.subscribe` stream (or make it throw), as a host restart or dropped stream would. */
+	endStreams(options?: { throw?: boolean }): void
+	/** How many times `event.subscribe` has been called. */
+	subscriptions(): number
 	/** Call a registered tool the way opencode does, returning its text. */
 	run(name: string, input: unknown, sessionID: string): Promise<string>
 	/** Run the session `context` hooks over a system prompt and return its texts. */
@@ -53,6 +57,8 @@ export async function loadV2(
 	const hooks = new Map<string, Array<(input: any) => unknown>>()
 	const synthetic: SyntheticCall[] = []
 	const subscribers = new Set<(event: any) => void>()
+	const enders = new Set<(fail: boolean) => void>()
+	let subscribeCalls = 0
 
 	const registration = { dispose: async () => {} }
 	const addHook = async (name: string, callback: (input: any) => unknown) => {
@@ -88,18 +94,27 @@ export async function loadV2(
 		},
 		event: {
 			subscribe: (options?: { types?: string[]; signal?: AbortSignal }) => {
+				subscribeCalls++
 				const queue: any[] = []
 				let wake: (() => void) | undefined
+				let ended: "end" | "throw" | undefined
 				const push = (event: any) => {
 					if (options?.types && !options.types.includes(event.type)) return
 					queue.push(event)
 					wake?.()
 				}
+				const ender = (fail: boolean) => {
+					ended = fail ? "throw" : "end"
+					wake?.()
+				}
 				subscribers.add(push)
+				enders.add(ender)
 				return {
 					async *[Symbol.asyncIterator]() {
 						try {
 							while (!options?.signal?.aborted) {
+								if (ended === "throw") throw new Error("event stream failed")
+								if (ended === "end") return
 								if (queue.length === 0) {
 									await new Promise<void>((resolve) => {
 										wake = resolve
@@ -112,6 +127,7 @@ export async function loadV2(
 							}
 						} finally {
 							subscribers.delete(push)
+							enders.delete(ender)
 						}
 					},
 				}
@@ -129,6 +145,10 @@ export async function loadV2(
 		emit(event) {
 			for (const push of subscribers) push(event)
 		},
+		endStreams(options) {
+			for (const end of [...enders]) end(options?.throw ?? false)
+		},
+		subscriptions: () => subscribeCalls,
 		async run(name, input, sessionID) {
 			const tool = tools.get(name)
 			if (!tool) throw new Error(`no tool ${name}`)

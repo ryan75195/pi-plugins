@@ -89,3 +89,36 @@ test("a session's run reaches /event as V1 session.status and session.idle, and 
     { type: "session.idle", properties: { sessionID: "ses_r" } },
   ], "another directory's event is not forwarded")
 })
+
+test("a dropped event subscription is reopened, so /event keeps streaming", async () => {
+  const instance = await openTestInstance()
+  try {
+    const stream = await instance.request("GET", "/event")
+    const reader = (stream.body as ReadableStream<Uint8Array>).getReader()
+    const decoder = new TextDecoder()
+    assert.equal(instance.fake.subscriptions(), 1)
+    instance.fake.endStreams()
+    const deadline = Date.now() + 5_000
+    while (instance.fake.subscriptions() < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(instance.fake.subscriptions(), 2, "it subscribed again")
+    instance.fake.emit({ type: "session.renamed", data: { sessionID: "ses_after", title: "t" } })
+    let text = ""
+    while ((text.match(/^data: /gm) ?? []).length < 2) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      text += decoder.decode(chunk.value, { stream: true })
+    }
+    await reader.cancel()
+    const types = text
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => (JSON.parse(line.slice(6)) as { payload: { type: string } }).payload.type)
+    assert.deepEqual(types, ["server.connected", "session.renamed"])
+  } finally {
+    await instance.close()
+  }
+  const after = instance.fake.subscriptions()
+  instance.fake.endStreams()
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  assert.equal(instance.fake.subscriptions(), after, "no resubscribe after unload")
+})

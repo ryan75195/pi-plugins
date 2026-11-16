@@ -49,6 +49,10 @@ export type FakeOpencode = {
   switches: Array<{ sessionID: string; agent?: string; model?: unknown }>
   permissionReplies: Array<{ sessionID: string; requestID: string; decision: string }>
   emit: (event: FakeEvent) => void
+  /** End the open event stream(s), as a host restart or a dropped stream would. */
+  endStreams: () => void
+  /** How many times the plugin has subscribed to events. */
+  subscriptions: () => number
 }
 
 class NotFound extends Error {
@@ -95,6 +99,8 @@ export function createFakeOpencode(options: {
   // The event channel: emitted events queue until the plugin's subscription pulls them.
   const queue: FakeEvent[] = []
   let wake: (() => void) | undefined
+  let generation = 0
+  let subscribeCalls = 0
   const emit = (event: FakeEvent) => {
     queue.push(event)
     wake?.()
@@ -260,10 +266,13 @@ export function createFakeOpencode(options: {
       },
     },
     event: {
-      subscribe: (opts?: { signal?: AbortSignal }) => ({
+      subscribe: (opts?: { signal?: AbortSignal }) => {
+        subscribeCalls++
+        const born = generation
+        return {
         async *[Symbol.asyncIterator]() {
           for (;;) {
-            if (opts?.signal?.aborted) return
+            if (opts?.signal?.aborted || generation !== born) return
             const next = queue.shift()
             if (next) {
               yield { id: `evt_${clock++}`, created: clock, ...next }
@@ -276,7 +285,8 @@ export function createFakeOpencode(options: {
             wake = undefined
           }
         },
-      }),
+        }
+      },
     },
   }
 
@@ -295,5 +305,10 @@ export function createFakeOpencode(options: {
     switches,
     permissionReplies,
     emit,
+    endStreams: () => {
+      generation++
+      wake?.()
+    },
+    subscriptions: () => subscribeCalls,
   }
 }

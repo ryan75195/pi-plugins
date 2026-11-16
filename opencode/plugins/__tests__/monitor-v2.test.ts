@@ -77,3 +77,25 @@ test("Deleting a session ends its watches", async () => {
 		await h.cleanup?.()
 	}
 })
+
+test("A dropped event stream is reopened, so deleting a session still ends its watches", async () => {
+	const h = await loadV2(plugin)
+	try {
+		const command = process.platform === "win32" ? "ping -n 30 127.0.0.1 >nul" : "sleep 30"
+		const started = await h.run("monitor", { command, description: "resubscribed watch", persistent: true }, "ses_r")
+		const id = /Watching \((m[0-9a-f]+)\)/.exec(started)?.[1]
+		assert.equal(h.subscriptions(), 1)
+		h.endStreams({ throw: true })
+		await waitUntil(() => h.subscriptions() === 2)
+		h.endStreams()
+		await waitUntil(() => h.subscriptions() === 3)
+		h.emit({ type: "session.deleted", data: { sessionID: "ses_r" } })
+		await waitUntil(() => h.synthetic.some((s) => s.text === `[monitor ${id} resubscribed watch ended: session ended]`))
+	} finally {
+		await h.cleanup?.()
+	}
+	const after = h.subscriptions()
+	h.endStreams()
+	await new Promise((resolve) => setTimeout(resolve, 600))
+	assert.equal(h.subscriptions(), after, "no resubscribe after unload")
+})

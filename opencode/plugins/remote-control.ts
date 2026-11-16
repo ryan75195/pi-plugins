@@ -1798,6 +1798,45 @@ function readToolInput(input: unknown): { action: RemoteControlAction; name?: st
   return { action, ...(name ? { name } : {}) }
 }
 
+const RESUBSCRIBE_MIN_MS = 250
+const RESUBSCRIBE_MAX_MS = 10_000
+
+/**
+ * Feeds every event of `subscribe()` to `onEvent` for as long as the plugin is
+ * loaded. A stream that ends or throws is reopened after a short backoff
+ * (doubling to a cap, reset once events flow again) instead of leaving the
+ * plugin deaf for good; aborting `signal` (the plugin's unload) stops it. A
+ * failing handler costs that one event, not the subscription.
+ */
+async function followEvents<E>(
+  signal: AbortSignal,
+  subscribe: () => AsyncIterable<E>,
+  onEvent: (event: E) => void | Promise<void>,
+  onError: (error: unknown) => void = () => {},
+): Promise<void> {
+  let delay = RESUBSCRIBE_MIN_MS
+  while (!signal.aborted) {
+    try {
+      for await (const event of subscribe()) {
+        delay = RESUBSCRIBE_MIN_MS
+        try {
+          await onEvent(event)
+        } catch (error) {
+          onError(error)
+        }
+      }
+    } catch (error) {
+      if (!signal.aborted) onError(error)
+    }
+    if (signal.aborted) return
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, delay)
+      signal.addEventListener("abort", () => (clearTimeout(timer), resolve()), { once: true })
+    })
+    delay = Math.min(delay * 2, RESUBSCRIBE_MAX_MS)
+  }
+}
+
 async function setup(ctx: Plugin.Context): Promise<() => void> {
   const api: RemoteControlApi = ctx
   const directory: string = ctx.location.directory
@@ -2005,19 +2044,12 @@ ${serve.out}`
   // V1's `event` hook is a subscription in V2; relayInstanceEvent maps each
   // event to the V1 shape the native clients parse.
   const subscription = new AbortController()
-  void (async () => {
-    try {
-      for await (const raw of ctx.event.subscribe({ signal: subscription.signal })) {
-        try {
-          relayInstanceEvent(directory, raw, statuses)
-        } catch (e) {
-          log(`event forward failed: ${String(e).slice(0, 160)}`)
-        }
-      }
-    } catch (e) {
-      if (!subscription.signal.aborted) log(`event subscription ended: ${String(e).slice(0, 160)}`)
-    }
-  })()
+  void followEvents(
+    subscription.signal,
+    () => ctx.event.subscribe({ signal: subscription.signal }),
+    (raw) => relayInstanceEvent(directory, raw, statuses),
+    (e) => log(`event forward/subscription failed (resubscribing if it ended): ${String(e).slice(0, 160)}`),
+  )
 
   return () => {
     subscription.abort()
