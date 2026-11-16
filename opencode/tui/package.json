@@ -1,12 +1,18 @@
 {
   "name": "pi-plugins-opencode-tui",
   "private": true,
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "check:load": "bun run --preload ./node_modules/@opentui/solid/scripts/preload.js check-load.ts"
+  },
   "dependencies": {
-    "solid-js": "1.9.12"
+    "solid-js": "1.9.17"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
-    "@opentui/solid": "^0.5.10",
+    "@opencode/plugin": "2.3.0",
+    "@opencode/theme": "2.3.0",
+    "@opentui/core": "0.8.4",
+    "@opentui/solid": "0.8.4",
     "@types/node": "^24",
     "typescript": "^5"
   }

@@ -28,7 +28,7 @@ session via `prompt_async`:
 - **Output**: streamed to `<tmpdir>/opencode-background-tasks/<task-id>.log` (readable with opencode's `read` tool). 50MB cap per task; further output discarded with a note in the file.
 - **Cleanup**: kill the process when stopping; Windows kills the whole process tree.
 - **Environment**: children receive `OPENCODE_BG_TASK_ID`.
-- No live task panel in the chat area, BUT: a **TUI sidebar section** ([tui/background-tasks-sidebar.tsx](tui/background-tasks-sidebar.tsx)) renders running/finished tasks in the right-hand panel (`ctrl+x b`), with live elapsed times and click-to-stop (confirmation dialog). Pairs with the server plugin via a shared state file.
+- No live task panel in the chat area, BUT: a **TUI sidebar section** ([tui/background-tasks-sidebar/](tui/background-tasks-sidebar/tui.tsx)) renders running/finished tasks in the right-hand panel (`ctrl+x b`), with live elapsed times and click-to-stop (confirmation dialog). Pairs with the server plugin via a shared state file.
 - **`/processes` command** ([commands/processes.md](commands/processes.md), install to `~/.config/opencode/commands/`): appears in the TUI command menu. Shows a compact status table via `task_list`; supports `stop <id>`, `view <id>`, `stop all` arguments. The table format and argument handling live in the `task_list` / `task_stop` / `task_output` tool descriptions, not the template — see [Command templates](#command-templates).
 
 ## Install
@@ -70,34 +70,47 @@ only as a pointer to this mechanism; nothing needs to be copied to
 
 ## Sidebar (TUI) install
 
-The TUI plugins render live sections in opencode's right-hand panel:
+The TUI plugins render live sections in opencode's right-hand panel. They use
+the opencode 2.3 TUI plugin API (`Plugin.define` from `@opencode/plugin/tui`):
 
-| File | Section |
+| Directory | Section |
 |---|---|
-| [tui/background-tasks-sidebar.tsx](tui/background-tasks-sidebar.tsx) | "Background tasks" — running/finished tasks, click-to-stop |
-| [tui/goal-indicator.tsx](tui/goal-indicator.tsx) | "Goal" — live `/goal` condition, turns, last reason |
-| [tui/remote-control-sidebar.tsx](tui/remote-control-sidebar.tsx) | "Remote Control" — off / registered / clients connected |
+| [tui/background-tasks-sidebar/](tui/background-tasks-sidebar/tui.tsx) | "Background tasks" — running/finished tasks, click-to-stop, ctrl+b hint |
+| [tui/goal-indicator/](tui/goal-indicator/tui.tsx) | "Goal" — live `/goal` (or `/loop`) condition, turns, last reason, from goal-loop's per-session state files |
+| [tui/remote-control-sidebar/](tui/remote-control-sidebar/tui.tsx) | "Remote Control" — off / registered / clients connected |
 
-They are **not** copied by `npm run install:opencode`: they are registered
-from the repo by absolute path, because they resolve `solid-js` and
-`@opentui/solid` out of `opencode/tui/node_modules`.
+opencode 2.3 loads a local TUI plugin from a **directory** (it imports the
+directory's `tui.tsx`); a path to a single `.tsx` file is skipped without an
+error. They are **not** copied by `npm run install:opencode`: they are
+registered from the repo by absolute path.
 
 ```bash
-# 1. Dependencies for the TUI plugins (solid-js + @opentui/solid)
-cd /path/to/pi-plugins/opencode/tui && npm install
+# 1. Dependencies for type-checking the TUI plugins (opencode itself supplies
+#    solid-js, @opentui/* and @opencode/plugin at runtime)
+cd /path/to/pi-plugins/opencode/tui && npm install && npm run typecheck
 ```
 
 ```jsonc
-// 2. Register them in ~/.config/opencode/tui.json
+// 2. Register them in ~/.config/opencode/cli.json (opencode 2.3 moved the TUI
+//    config there from tui.json; keep the file's other settings)
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "C:/absolute/path/to/pi-plugins/opencode/tui/background-tasks-sidebar.tsx",
-    "C:/absolute/path/to/pi-plugins/opencode/tui/goal-indicator.tsx",
-    "C:/absolute/path/to/pi-plugins/opencode/tui/remote-control-sidebar.tsx"
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": [
+    "C:/absolute/path/to/pi-plugins/opencode/tui/remote-control-sidebar",
+    "C:/absolute/path/to/pi-plugins/opencode/tui/goal-indicator",
+    "C:/absolute/path/to/pi-plugins/opencode/tui/background-tasks-sidebar"
   ]
 }
 ```
+
+The 2.3 slot API has no per-section order number, so sections appear in the
+order they are listed in `plugins`; the list above keeps the old order
+(Remote Control, Goal, Background tasks).
+
+`npm run check:load` (in `opencode/tui`) loads each directory the way the
+opencode 2.3 TUI does and renders its sections against sample state in a
+private temp folder; it needs Bun, which the opencode binary provides
+(`BUN_BE_BUN=1 opencode run ...`, see the script's header).
 
 Then open opencode and toggle the sidebar with `ctrl+x b`. Start a task with
 `bash_background` and it appears with a live spinner, elapsed time and exit
@@ -121,13 +134,13 @@ running locally; the remote client is a window into it.
   endpoint inside the opencode server process (Bun.serve) and publishes it via
   `tailscale serve --bg` (tailnet-only, never public; token-gated on top).
 - `opencode/commands/remote-control.md` — `/remote-control [name]`, `off`, `status`.
-- `opencode/tui/remote-control-sidebar.tsx` — TUI sidebar indicator (see
+- `opencode/tui/remote-control-sidebar/` — TUI sidebar indicator (see
   [Sidebar (TUI) install](#sidebar-tui-install)). One quiet line while off
   (`○ Remote Control  off · /remote-control to connect`); once registered it
   shows the mount path, and turns green with `N clients connected` and the
   elapsed time while a phone or browser is attached. It finds this instance's
-  registration in the shared state file by pid, else by working directory, and
-  treats a dead pid as off.
+  registration in the shared state file by pid, else by the session's
+  directory (then the TUI's own), and treats a dead pid as off.
 
 The state file entry carries `clients`, the number of live native `/event`
 subscribers, refreshed (with `updatedAt`) every time a stream opens or closes.
