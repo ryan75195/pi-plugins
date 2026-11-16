@@ -76,7 +76,7 @@ the opencode 2.3 TUI plugin API (`Plugin.define` from `@opencode/plugin/tui`):
 | Directory | Section |
 |---|---|
 | [tui/background-tasks-sidebar/](tui/background-tasks-sidebar/tui.tsx) | "Background tasks" — running/finished tasks, click-to-stop, ctrl+b hint |
-| [tui/goal-indicator/](tui/goal-indicator/tui.tsx) | "Goal" — live `/goal` condition, turns, last reason |
+| [tui/goal-indicator/](tui/goal-indicator/tui.tsx) | "Goal" — live `/goal` (or `/loop`) condition, turns, last reason, from goal-loop's per-session state files |
 | [tui/remote-control-sidebar/](tui/remote-control-sidebar/tui.tsx) | "Remote Control" — off / registered / clients connected |
 
 opencode 2.3 loads a local TUI plugin from a **directory** (it imports the

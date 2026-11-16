@@ -30,7 +30,7 @@ const PRELOAD = join(HERE, "node_modules", "@opentui", "solid", "scripts", "prel
 if (!process.env.TUI_CHECK_TEMP) {
 	const temp = mkdtempSync(join(tmpdir(), "tui-check-"))
 	const child = Bun.spawnSync([process.execPath, "run", "--preload", PRELOAD, fileURLToPath(import.meta.url)], {
-		env: { ...process.env, TEMP: temp, TMP: temp, TMPDIR: temp, TUI_CHECK_TEMP: temp },
+		env: { ...process.env, TEMP: temp, TMP: temp, TMPDIR: temp, TUI_CHECK_TEMP: temp, OPENCODE_GOAL_STATE_DIR: join(temp, "goal-state") },
 		stdout: "inherit",
 		stderr: "inherit",
 	})
@@ -77,8 +77,18 @@ write("opencode-background-tasks", {
 		{ id: "bg-3", sessionID: "ses_A", command: "sleep 100", pid: process.pid, startedAt: now - 3000, exitCode: null, status: "running", outputFile: "c", truncated: false, foreground: true, backgrounded: false },
 	],
 })
+// goal-loop (opencode-architect) keeps one file per session: <repoKey>.<sessionID>.json,
+// plus a .spent.json ledger the sidebar must ignore.
+const goalDir = process.env.OPENCODE_GOAL_STATE_DIR!
+mkdirSync(goalDir, { recursive: true })
+writeFileSync(
+	join(goalDir, "0123456789ab.ses_A.json"),
+	JSON.stringify({ kind: "goal", text: "all tests pass", intervalMs: null, until: null, status: "active", turns: 3, maxTurns: 50, startedAt: now - 30_000, expiresAt: now + 3_600_000, lastReason: "2 tests still failing", stalledTurns: 0, agent: "build" }),
+)
+writeFileSync(join(goalDir, "0123456789ab.ses_A.spent.json"), JSON.stringify({ turns: 7 }))
+// The older goal plugin's shared file: an older run for the same session, which must lose.
 write("opencode-goal", {
-	goals: [{ sessionID: "ses_A", condition: "all tests pass", startedAt: now - 30_000, turns: 3, lastReason: "2 tests still failing", status: "active" }],
+	goals: [{ sessionID: "ses_A", condition: "stale legacy goal", startedAt: now - 900_000, turns: 9, status: "paused" }],
 })
 write("opencode-remote", {
 	registrations: [{ id: "x", mount: "/rc-5e34d34d7587", name: "n", directory: project, startedAt: now - 60_000, pid: server.pid, clients: 1 }],
@@ -87,7 +97,7 @@ write("opencode-remote", {
 // What each plugin's sections must show for the sample state above.
 const expected: Record<string, string[]> = {
 	"background-tasks-sidebar": ["ctrl+b background · bg-3 sleep 100", "▸ Background tasks · 1 running"],
-	"goal-indicator": ["◎ Goal active · ", "3 turns", "all tests pass", "↳ 2 tests still failing"],
+	"goal-indicator": ["◎ Goal active · 3", "3 turns", "all tests pass", "↳ 2 tests still failing"],
 	"remote-control-sidebar": ["● Remote Control 1 client connected", "/rc-5e34d34d7587 · 1m"],
 }
 
@@ -142,6 +152,7 @@ for (const name of Object.keys(expected)) {
 		r.renderer.destroy()
 	}
 	for (const want of expected[name]) check(text.includes(want), `shows "${want}"`)
+	if (name === "goal-indicator") check(!text.includes("stale legacy goal"), "the newer goal-loop run wins over the older legacy entry")
 
 	for (const factory of layers) {
 		for (const cmd of factory().commands) {
