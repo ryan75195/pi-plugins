@@ -567,23 +567,61 @@ function pickAnswers(value: unknown): string[][] | undefined {
   return answers
 }
 
-let server: ReturnType<typeof Bun.serve> | undefined
-let startedHere = false // this process actually published the tailscale serve entry
-let activeState: RemoteState | undefined // this process's registration (in-memory truth)
+type LocalServer = { stop(closeActiveConnections?: boolean): void }
+type ServeOptions = Parameters<typeof Bun.serve>[0]
+
+/**
+ * What Remote Control needs from the machine: a local HTTP server, the tailscale
+ * CLI and the tailnet name. Exported (an object, so the loader never calls it) so
+ * the contract tests can stand in for Bun and tailscale.
+ */
+export const remoteControlHost = {
+  serve: (options: ServeOptions): LocalServer => Bun.serve(options),
+  tailscale: (args: string[]): { ok: boolean; out: string } => runTailscale(args),
+  machineHost: (): string | undefined => readMachineHost(),
+  freePort: (): number => findFreePort(),
+}
+
+/**
+ * One Remote Control registration in this process. Under opencode 2.3 a single
+ * `opencode serve --service` process hosts every directory the TUI opens, and the
+ * plugin's setup runs once per directory, so everything that used to be "this
+ * process's" registration is kept per directory: its own server, port, mount,
+ * token and registration entry (keyed by pid + directory in the state file).
+ */
+type Instance = { state: RemoteState; server: LocalServer }
+const instances = new Map<string, Instance>()
 let eventLog: Array<{ type: string; sessionID?: string }> = []
-const sseClients = new Set<{ session?: string; write: (chunk: string) => void }>()
+type WebClient = { session?: string; write: (chunk: string) => void }
+// The web page's /api/events subscribers, per directory.
+const sseClients = new Map<string, Set<WebClient>>()
 type NativeStreamSink = { write: (chunk: string) => boolean }
 // Phone / native clients on GET /event, keyed by instance directory and fed by
 // the plugin's event subscription (forwardInstanceEvent).
 const nativeStreamSinks = new Map<string, Set<NativeStreamSink>>()
-// Live /event subscribers, counted so a leaked subscription shows up in the log
-// rather than only as quietly growing memory.
-let openEventStreams = 0
+// Live /event subscribers per directory, counted so a leaked subscription shows
+// up in the log rather than only as quietly growing memory.
+const openEventStreams = new Map<string, number>()
+
+/** The key one directory's state is kept under: slash direction, case and a trailing slash don't matter. */
+function dirKey(directory: string): string {
+  return directory.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+}
+
+function openStreamsOf(directory: string): number {
+  return openEventStreams.get(dirKey(directory)) ?? 0
+}
+
+/** This directory's entry in the shared registration list: this process AND this directory. */
+function isOwnRegistration(r: RemoteState, directory: string): boolean {
+  return r.pid === process.pid && typeof r.directory === "string" && sameDirectory(r.directory, directory)
+}
 
 /**
- * Registrations are stored per machine as a LIST keyed by process pid —
- * multiple opencode instances can be remote-controlled simultaneously, and
- * each instance may only modify its own entry. The mount used for a stop is
+ * Registrations are stored per machine as a LIST keyed by process pid AND
+ * directory — multiple opencode instances (and, under opencode 2.3, several
+ * directories hosted by one process) can be remote-controlled simultaneously,
+ * and each may only modify its own entry. The mount used for a stop is
  * taken from memory (the starting process knows it); the file is advisory,
  * for `status` and cross-instance visibility.
  *
@@ -673,19 +711,19 @@ function updateRegistrations(mutate: (regs: RemoteState[]) => RemoteState[], ...
 export { updateRegistrations }
 
 /**
- * Mirror the live subscriber count into this process's entry so anything
+ * Mirror the live subscriber count into this directory's entry so anything
  * reading the state file — the TUI sidebar, `status` — can tell "registered"
  * from "a phone is actually attached". Re-adds the entry if a clobber from an
  * older build removed it. Best effort by design: a failed write must never
  * take down an event stream.
  */
-function persistClientCount(): void {
+function persistClientCount(directory: string): void {
   try {
-    const snapshot = activeState
+    const snapshot = instances.get(dirKey(directory))?.state
     if (!snapshot) return
     updateRegistrations((regs) => {
-      const entry = { ...snapshot, clients: openEventStreams, updatedAt: Date.now() }
-      const index = regs.findIndex((r) => r.pid === process.pid)
+      const entry = { ...snapshot, clients: openStreamsOf(directory), updatedAt: Date.now() }
+      const index = regs.findIndex((r) => isOwnRegistration(r, snapshot.directory))
       if (index === -1) return [...regs, entry]
       return regs.map((r, i) => (i === index ? { ...r, ...entry } : r))
     })
@@ -699,7 +737,9 @@ let heartbeat: ReturnType<typeof setInterval> | undefined
 
 function startHeartbeat(): void {
   if (heartbeat) return
-  heartbeat = setInterval(() => persistClientCount(), HEARTBEAT_MS)
+  heartbeat = setInterval(() => {
+    for (const instance of instances.values()) persistClientCount(instance.state.directory)
+  }, HEARTBEAT_MS)
   heartbeat.unref?.()
 }
 
@@ -861,6 +901,10 @@ function spawnTailscale(cmd: string, args: string[]) {
 }
 
 function tailscale(args: string[]): { ok: boolean; out: string } {
+  return remoteControlHost.tailscale(args)
+}
+
+function runTailscale(args: string[]): { ok: boolean; out: string } {
   let last = ""
   const startedAt = Date.now()
   for (const cmd of TAILSCALE_CANDIDATES) {
@@ -886,6 +930,10 @@ function tailscale(args: string[]): { ok: boolean; out: string } {
 let cachedHost: string | undefined
 
 function machineHost(): string | undefined {
+  return remoteControlHost.machineHost()
+}
+
+function readMachineHost(): string | undefined {
   if (cachedHost) return cachedHost
   for (const cmd of TAILSCALE_CANDIDATES) {
     const r = spawnTailscale(cmd, ["status", "--json"])
@@ -915,11 +963,11 @@ function machineName(): string {
  */
 function instanceId(dir: string): string {
   const base = createHash("sha1").update(dir).digest("hex").slice(0, 12)
-  const clash = loadRegistrations().some((r) => r.id === base && r.pid !== process.pid && pidAlive(r.pid))
+  const clash = loadRegistrations().some((r) => r.id === base && !isOwnRegistration(r, dir) && pidAlive(r.pid))
   return clash ? `${base}-${process.pid}` : base
 }
 
-function freePort(): number {
+function findFreePort(): number {
   for (let p = BASE_PORT; p < BASE_PORT + 20; p++) {
     try {
       const probe = Bun.serve({ hostname: "127.0.0.1", port: p, fetch: () => new Response("") })
@@ -999,6 +1047,17 @@ export type InstanceRouteDeps = {
   sessionStatus?: () => Record<string, unknown>
 }
 
+/** Thrown for a session id that exists but belongs to another directory: answered like an unknown id. */
+class SessionNotInDirectory extends Error {
+  readonly _tag = "Session.NotFoundError"
+  readonly sessionID: string
+  constructor(sessionID: string) {
+    super(`Session not found: ${sessionID}`)
+    this.sessionID = sessionID
+    this.name = "Session.NotFoundError"
+  }
+}
+
 export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unknown[]): (req: Request) => Promise<Response> {
   // deps legitimately carries api and directory (it needs them for the routes it
   // builds), so the shared shape check used elsewhere would false-positive here — this
@@ -1008,6 +1067,15 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
   const listSessions = deps.listSessions ?? (() => webSessions(api, directory))
   const messagesOf = deps.messagesOf ?? ((sid: string) => webMessages(api, sid))
   const sessionStatus = deps.sessionStatus ?? (() => ({}))
+
+  // V1 scoped every session call with `query: { directory }`; V2 addresses a
+  // session by id alone, and one process hosts every directory. A session that
+  // lives in another directory is answered exactly like an unknown id, so an
+  // instance token never reaches another project's sessions.
+  const owned = async (sessionID: string): Promise<void> => {
+    const located = str(asLoose(asLoose(await api.session.get({ sessionID })).location).directory)
+    if (located === undefined || !sameDirectory(located, directory)) throw new SessionNotInDirectory(sessionID)
+  }
 
   // Runs one host call and answers with its (already V1-shaped) result, or with
   // the upstream error and its own status. `undefined` (a V2 call with no body)
@@ -1117,6 +1185,7 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
           const title = typeof body.title === "string" ? body.title.trim() : ""
           if (title.length === 0) return json({ error: "title required" }, 400)
           return sdk(async () => {
+            await owned(id)
             await api.session.update({ sessionID: id, title })
             return toV1Session(await api.session.get({ sessionID: id }), directory)
           })
@@ -1128,6 +1197,7 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
         if (parts.length === 2 && req.method === "DELETE") {
           const id = parts[1]!
           return sdk(async () => {
+            await owned(id)
             await api.session.remove({ sessionID: id })
             return true
           })
@@ -1137,6 +1207,7 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
           if (parts[2] === "message" && req.method === "GET") {
             const limit = Number(url.searchParams.get("limit"))
             return sdk(async () => {
+              await owned(id)
               const rows = await v1Messages(api, id)
               return Number.isFinite(limit) && limit > 0 ? rows.slice(-limit) : rows
             })
@@ -1152,6 +1223,7 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
             const model = pickModel(body.model)
             const agent = pickAgent(body.agent)
             return sdk(async () => {
+              await owned(id)
               await applySelection(api, id, model, agent)
               await api.session.prompt({ sessionID: id, ...toPromptInput(promptParts) })
               return undefined
@@ -1161,7 +1233,7 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
             // V2's interrupt answers `false` for an id it does not know; V1 failed
             // with the session's not-found error, so the id is checked first.
             return sdk(async () => {
-              await api.session.get({ sessionID: id })
+              await owned(id)
               return (await api.session.interrupt({ sessionID: id })).interrupted
             })
           }
@@ -1176,6 +1248,7 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
             const model = pickModel(splitCommandModel(pickCommandModel(body.model)))
             const agent = pickAgent(body.agent)
             return sdk(async () => {
+              await owned(id)
               await applySelection(api, id, model, agent)
               await api.session.command({ sessionID: id, name: body.command ?? "", text: body.arguments ?? "" })
               return undefined
@@ -1189,6 +1262,7 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
             }
             const requestID = parts[3]
             return sdk(async () => {
+              await owned(id)
               await api.permission.reply({ sessionID: id, requestID, decision })
               return true
             })
@@ -1207,6 +1281,11 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
       const sid = url.searchParams.get("session")
       if (!sid) return json({ error: "session required" }, 400)
       try {
+        await owned(sid)
+      } catch (e) {
+        return failure(e)
+      }
+      try {
         return json(await messagesOf(sid))
       } catch (e) {
         return json({ error: String(e) }, 502)
@@ -1216,6 +1295,11 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
     if (url.pathname === "/api/send" && req.method === "POST") {
       const body = (await req.json()) as { session?: string; text?: string }
       if (!body.session || !body.text?.trim()) return json({ error: "session and text required" }, 400)
+      try {
+        await owned(body.session)
+      } catch (e) {
+        return failure(e)
+      }
       await api.session.prompt({ sessionID: body.session, text: body.text.trim() })
       return json({ ok: true, queued: true })
     }
@@ -1236,7 +1320,12 @@ export function makeInstanceRouteHandler(deps: InstanceRouteDeps, ...rest: unkno
             if (closed) return
             controller.enqueue(enc.encode(chunk))
           }
-          sseClients.add({ session: sid, write })
+          let clients = sseClients.get(dirKey(directory))
+          if (!clients) {
+            clients = new Set()
+            sseClients.set(dirKey(directory), clients)
+          }
+          clients.add({ session: sid, write })
           write("retry: 3000\n\n")
           keepalive = setInterval(() => {
             if (closed) {
@@ -1289,18 +1378,18 @@ export function openInstanceEventStream(directory: string, ...rest: unknown[]): 
     if (keepalive) clearInterval(keepalive)
     keepalive = undefined
     if (sink) nativeStreamSinks.get(directory)?.delete(sink)
-    openEventStreams = Math.max(0, openEventStreams - 1)
-    persistClientCount()
-    log(`event stream closed (${reason}) open=${openEventStreams}`)
+    openEventStreams.set(dirKey(directory), Math.max(0, openStreamsOf(directory) - 1))
+    persistClientCount(directory)
+    log(`event stream closed (${reason}) dir=${directory} open=${openStreamsOf(directory)}`)
   }
 
   // Events come from the plugin's own V2 event subscription (ctx.event.subscribe,
   // mapped to the V1 { type, properties } shape and pushed via forwardInstanceEvent).
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      openEventStreams++
-      persistClientCount()
-      log(`event stream opened open=${openEventStreams}`)
+      openEventStreams.set(dirKey(directory), openStreamsOf(directory) + 1)
+      persistClientCount(directory)
+      log(`event stream opened dir=${directory} open=${openStreamsOf(directory)}`)
       const write = (chunk: string): boolean => {
         if (closed) return false
         try {
@@ -1360,12 +1449,13 @@ export function forwardInstanceEvent(directory: string, event: RemoteControlEven
   eventLog.push({ type: event.type, sessionID: sid })
   if (eventLog.length > MAX_EVENTS) eventLog = eventLog.slice(-MAX_EVENTS)
   const line = `data: ${JSON.stringify({ type: event.type, sessionID: sid })}\n\n`
-  for (const c of sseClients) {
+  const webClients = sseClients.get(dirKey(directory))
+  for (const c of webClients ?? []) {
     if (!c.session || !sid || c.session === sid) {
       try {
         c.write(line)
       } catch {
-        sseClients.delete(c)
+        webClients?.delete(c)
       }
     }
   }
@@ -1423,7 +1513,7 @@ function sameDirectory(a: string, b: string): boolean {
 // belongs to no particular instance: whichever registered process can bind the
 // port hosts it, and the rest take over within a watchdog tick if it dies.
 
-let hubServer: ReturnType<typeof Bun.serve> | undefined
+let hubServer: LocalServer | undefined
 let hubWatchdog: ReturnType<typeof setInterval> | undefined
 
 type InstanceView = {
@@ -1540,7 +1630,7 @@ async function hubHandler(req: Request): Promise<Response> {
 function tryHostHub(): boolean {
   if (hubServer) return true
   try {
-    hubServer = Bun.serve({ hostname: "127.0.0.1", port: HUB_PORT, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: guarded(hubHandler) })
+    hubServer = remoteControlHost.serve({ hostname: "127.0.0.1", port: HUB_PORT, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: guarded(hubHandler) })
     return true
   } catch {
     return false // another instance already hosts it — the normal case
@@ -1740,13 +1830,20 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
     })
   }
 
+  const key = dirKey(directory)
+
   async function start(name: string | undefined, sessionID: string): Promise<string> {
-    if (server && activeState) {
-      return `Remote Control already active in this process.\nURL: ${activeState.url}`
+    const active = instances.get(key)
+    if (active) {
+      return `Remote Control already active for this directory.\nURL: ${active.state.url}`
     }
     await pruneStale()
+    // Another start for this directory (a resume racing a tool call) may have
+    // finished while the stale mounts were pruned.
+    const raced = instances.get(key)
+    if (raced) return `Remote Control already active for this directory.\nURL: ${raced.state.url}`
     const tok = randomBytes(16).toString("hex")
-    const port = freePort()
+    const port = remoteControlHost.freePort()
     const id = instanceId(directory)
     // One stable path per instance. The tailnet root is never claimed: a
     // path-less `serve --bg` silently replaces whatever holds "/", which is
@@ -1764,18 +1861,17 @@ async function setup(ctx: Plugin.Context): Promise<() => void> {
       defaultSession: sessionID,
       startedAt: Date.now(),
       pid: process.pid,
-      clients: openEventStreams,
+      clients: openStreamsOf(directory),
       updatedAt: Date.now(),
     }
     const handler = makeHandler(tok, () => state)
 
-    server = Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: guarded(handler) })
+    const server = remoteControlHost.serve({ hostname: "127.0.0.1", port, idleTimeout: SERVER_IDLE_TIMEOUT_S, fetch: guarded(handler) })
 
     log(`start id=${id} port=${port} mount=${mount} dir=${directory}`)
     const serve = tailscale(["serve", "--bg", "--set-path", mount, String(port)])
     if (!serve.ok) {
       server.stop(true)
-      server = undefined
       log(`start failed: ${serve.out.slice(0, 200)}`)
       const enableUrl = serve.out.match(/https:\/\/login\.tailscale\.com\/f\/serve\?node=\S+/)?.[0]
       return enableUrl
@@ -1788,16 +1884,14 @@ ${serve.out}`
     const host = machineHost()
     if (!host) {
       server.stop(true)
-      server = undefined
       void tailscale(["serve", "--set-path", mount, "off"])
       return "could not read tailnet hostname (tailscale status failed)"
     }
     state.host = host
     state.url = `https://${host}${mount}/?t=${tok}`
-    activeState = state
-    updateRegistrations((regs) => [...regs.filter((r) => r.pid !== process.pid), state])
+    instances.set(key, { state, server })
+    updateRegistrations((regs) => [...regs.filter((r) => !isOwnRegistration(r, directory)), state])
     startHeartbeat()
-    startedHere = true
     writeResume(directory, { name: state.name, defaultSession: sessionID ?? "" })
     // The hub is per machine, not per instance: publish the mount every time
     // (idempotent) and take the port if nobody holds it yet.
@@ -1811,43 +1905,48 @@ ${serve.out}`
     ].join("\n")
   }
 
+  /**
+   * Turns Remote Control off for THIS directory only: its server, mount, web
+   * clients and registration. The hub port and the heartbeat are shared by every
+   * directory in the process, so they go only when no directory here is left.
+   */
   function stop(explicit = true): string {
-    if (server) {
-      server.stop(true)
-      server = undefined
-    }
-    // Drop the hub port too — any other live instance rebinds it on its next
-    // watchdog tick, so the machine stays discoverable.
-    releaseHub()
-    for (const c of sseClients) {
+    const active = instances.get(key)
+    instances.delete(key)
+    active?.server.stop(true)
+    // Drop the hub port too once nothing in this process is registered — any
+    // other live instance rebinds it on its next watchdog tick, so the machine
+    // stays discoverable.
+    if (instances.size === 0) releaseHub()
+    const webClients = sseClients.get(key)
+    for (const c of webClients ?? []) {
       try {
         c.write("event: shutdown\ndata: {}\n\n")
       } catch {
         /* client gone */
       }
     }
-    sseClients.clear()
-    if (!startedHere) return "Remote Control was not active in this process."
-    startedHere = false
-    stopHeartbeat()
+    sseClients.delete(key)
+    if (!active) return "Remote Control was not active for this directory."
+    if (instances.size === 0) stopHeartbeat()
     // Our mount is known in memory — never trust the shared file for this.
-    const mount = activeState?.mount
-    activeState = undefined
-    updateRegistrations((regs) => regs.filter((r) => r.pid !== process.pid))
+    const mount = active.state.mount
+    updateRegistrations((regs) => regs.filter((r) => !isOwnRegistration(r, directory)))
     if (explicit) clearResume(directory)
-    log(`stop mount=${mount ?? "-"}${explicit ? "" : " (resumable)"}`)
+    log(`stop mount=${mount} dir=${directory}${explicit ? "" : " (resumable)"}`)
     // Targeted removal of OUR path only. The root is never ours to remove.
-    const r =
-      mount !== undefined && mount.startsWith("/rc-")
-        ? tailscale(["serve", "--set-path", mount, "off"])
-        : { ok: true, out: "" }
+    const r = mount.startsWith("/rc-") ? tailscale(["serve", "--set-path", mount, "off"]) : { ok: true, out: "" }
     // The hub mount is shared: it goes away only with the last instance.
     if (liveRegistrations().length === 0) void tailscale(["serve", "--set-path", HUB_MOUNT, "off"])
     return r.ok ? "Remote Control off. Local session unaffected." : `Remote Control off, but tailscale removal failed: ${r.out}`
   }
 
   const resume = readResume(directory)
-  if (resume !== undefined && !loadRegistrations().some((r) => r.directory === directory && pidAlive(r.pid))) {
+  if (
+    resume !== undefined &&
+    !instances.has(key) &&
+    !loadRegistrations().some((r) => typeof r.directory === "string" && sameDirectory(r.directory, directory) && r.pid !== process.pid && pidAlive(r.pid))
+  ) {
     log(`resuming remote control for ${directory}`)
     void start(resume.name, resume.defaultSession)
   }
@@ -1871,7 +1970,7 @@ ${serve.out}`
   })
 
   async function runTool(args: { action: RemoteControlAction; name?: string }, sessionID: string): Promise<string> {
-    if (args.action === "toggle") return server ? stop() : start(args.name || undefined, sessionID)
+    if (args.action === "toggle") return instances.has(key) ? stop() : start(args.name || undefined, sessionID)
     if (args.action === "off") return stop()
     if (args.action === "pair" || args.action === "rotate-pairing") {
       if (args.action === "rotate-pairing") rotatePairingToken()
@@ -1893,7 +1992,7 @@ ${serve.out}`
       if (regs.length === 0) return "Remote Control: not active. Run /remote-control to register this session."
       const lines: string[] = []
       for (const r of regs) {
-        const mine = r.pid === process.pid ? " (this process)" : ""
+        const mine = isOwnRegistration(r, directory) ? " (this directory)" : ""
         lines.push(
           `${r.name}${mine} — active since ${new Date(r.startedAt).toLocaleTimeString()}\n  URL: ${r.url}\n  Default session: ${r.defaultSession}`,
         )

@@ -24,7 +24,13 @@ export type FakeMessage =
     }
   | { id: string; type: "agent-switched"; time: { created: number }; agent: string }
 
-type V2Session = { id: string; projectID: string; title: string; time: { created: number; updated: number } }
+type V2Session = {
+  id: string
+  projectID: string
+  title: string
+  time: { created: number; updated: number }
+  location: { directory: string }
+}
 
 export type FakeOpencode = {
   ctx: Record<string, unknown>
@@ -57,7 +63,8 @@ class NotFound extends Error {
 
 export function createFakeOpencode(options: {
   directory: string
-  sessions?: Array<{ id: string; title: string }>
+  /** `directory` places a session in another directory (the host knows it by id, but it isn't this instance's). */
+  sessions?: Array<{ id: string; title: string; directory?: string }>
   messages?: Record<string, FakeMessage[]>
 }): FakeOpencode {
   const { directory } = options
@@ -75,7 +82,13 @@ export function createFakeOpencode(options: {
   let createCounter = 0
 
   for (const s of options.sessions ?? []) {
-    sessions.set(s.id, { id: s.id, projectID: "contract", title: s.title, time: { created: clock, updated: clock++ } })
+    sessions.set(s.id, {
+      id: s.id,
+      projectID: "contract",
+      title: s.title,
+      time: { created: clock, updated: clock++ },
+      location: { directory: s.directory ?? directory },
+    })
   }
   for (const [id, rows] of Object.entries(options.messages ?? {})) messages.set(id, rows)
 
@@ -105,7 +118,12 @@ export function createFakeOpencode(options: {
       list: async (input: { directory?: string; cursor?: string }) => {
         call("session.list")
         if (input?.directory !== directory) throw new Error(`fake opencode: expected directory=${directory}`)
-        return { data: Array.from(sessions.values()).map((s) => structuredClone(s)), cursor: {} }
+        return {
+          data: Array.from(sessions.values())
+            .filter((s) => s.location.directory === directory)
+            .map((s) => structuredClone(s)),
+          cursor: {},
+        }
       },
       get: async (input: { sessionID: string }) => {
         call("session.get")
@@ -119,6 +137,7 @@ export function createFakeOpencode(options: {
           projectID: "contract",
           title: input.title ?? "",
           time: { created: clock, updated: clock++ },
+          location: { directory },
         }
         sessions.set(created.id, created)
         return structuredClone(created)

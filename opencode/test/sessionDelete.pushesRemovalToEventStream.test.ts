@@ -74,8 +74,9 @@ test("a listener subscribed to the event stream is told about the deletion witho
     })
 
     assert.deepEqual(
+      // session.get is the route's check that the session belongs to this directory.
       instance.fake.callNames(),
-      ["session.remove"],
+      ["session.get", "session.remove"],
       "the listener must learn of the deletion from the pushed event, not by re-listing sessions",
     )
   } finally {
