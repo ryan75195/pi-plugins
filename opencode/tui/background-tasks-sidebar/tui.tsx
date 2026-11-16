@@ -138,8 +138,17 @@ export default Plugin.define({
 			return tasks().find((t) => t.sessionID === sessionID && t.foreground && !t.backgrounded && t.status === "running" && pidAlive(t.pid))
 		}
 
+		// One read at a time: a slow read finishing after a newer one must not
+		// put older rows back.
+		let polling = false
 		const poll = async () => {
-			setTasks(await readTasks())
+			if (polling) return
+			polling = true
+			try {
+				setTasks(await readTasks())
+			} finally {
+				polling = false
+			}
 		}
 		const pollTimer = setInterval(poll, POLL_MS)
 		const tickTimer = setInterval(() => setNow(Date.now()), TICK_MS)
@@ -162,13 +171,24 @@ export default Plugin.define({
 		}
 
 		function requestStop(task: TaskSnapshot) {
-			ctx.ui.toast.show({
-				title: "Stopping task",
-				message: `${task.id}: ${task.command}`,
-				variant: "warning",
-				duration: 3000,
-			})
-			void requestStopTask(task).then(() => poll())
+			void requestStopTask(task).then(
+				() => {
+					ctx.ui.toast.show({
+						title: "Stopping task",
+						message: `${task.id}: ${task.command}`,
+						variant: "warning",
+						duration: 3000,
+					})
+					void poll()
+				},
+				(err: unknown) =>
+					ctx.ui.toast.show({
+						title: "Could not stop task",
+						message: `${task.id}: ${err instanceof Error ? err.message : String(err)}`,
+						variant: "error",
+						duration: 5000,
+					}),
+			)
 		}
 
 		// NOTE: triggered on mouse-UP, not mouse-down. On mouse-down the dialog
@@ -179,7 +199,8 @@ export default Plugin.define({
 				.then((confirmed) => {
 					if (confirmed) requestStop(task)
 				})
-				.catch(() => requestStop(task))
+				// A dialog that fails or is dismissed is not a yes: leave the task running.
+				.catch(() => {})
 		}
 
 		function summaryLine(list: TaskSnapshot[]): string {
@@ -218,13 +239,24 @@ export default Plugin.define({
 								if (current.type !== "session") return false
 								const task = foregroundForSession(current.sessionID)
 								if (!task) return false
-								void requestBackgroundSession(current.sessionID)
-								ctx.ui.toast.show({
-									title: "Moved to background",
-									message: `${task.id}: ${truncate(task.command, 60)} — you'll get the result when it finishes`,
-									variant: "success",
-									duration: 4000,
-								})
+								// The key is ours either way; the toast says whether the request
+								// actually reached the server plugin.
+								void requestBackgroundSession(current.sessionID).then(
+									() =>
+										ctx.ui.toast.show({
+											title: "Moved to background",
+											message: `${task.id}: ${truncate(task.command, 60)} — you'll get the result when it finishes`,
+											variant: "success",
+											duration: 4000,
+										}),
+									(err: unknown) =>
+										ctx.ui.toast.show({
+											title: "Could not move to background",
+											message: `${task.id}: ${err instanceof Error ? err.message : String(err)}`,
+											variant: "error",
+											duration: 5000,
+										}),
+								)
 							},
 						},
 					],
