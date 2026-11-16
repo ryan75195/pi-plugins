@@ -20,6 +20,7 @@ export interface FakeTool {
 	name: string
 	description: string
 	input: any
+	options?: { codemode?: boolean }
 	execute: (input: unknown, context: any) => Promise<{ content?: unknown }>
 }
 
@@ -38,8 +39,16 @@ export interface V2Harness {
 	context(system?: string[]): Promise<string[]>
 }
 
-export async function loadV2(plugin: { id: string; setup: (ctx: any) => any }, directory = process.cwd()): Promise<V2Harness> {
-	const tools = new Map<string, FakeTool>()
+/**
+ * `builtins` stand in for opencode's own tools (e.g. its `shell`): they are in
+ * the editor before the plugin's transform runs, as in a real opencode.
+ */
+export async function loadV2(
+	plugin: { id: string; setup: (ctx: any) => any },
+	directory = process.cwd(),
+	builtins: FakeTool[] = [],
+): Promise<V2Harness> {
+	const tools = new Map<string, FakeTool>(builtins.map((tool) => [tool.name, tool]))
 	const added: string[] = []
 	const hooks = new Map<string, Array<(input: any) => unknown>>()
 	const synthetic: SyntheticCall[] = []

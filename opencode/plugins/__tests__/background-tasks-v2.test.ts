@@ -25,6 +25,19 @@ test("The plugin registers each of its tools exactly once", async () => {
 	}
 })
 
+test("Its bash replaces opencode's own shell tool, leaving the model one shell tool", async () => {
+	const shell = { name: "shell", description: "built-in", input: {}, options: { codemode: false }, execute: async () => ({ content: "BUILT_IN" }) }
+	const h = await loadV2(plugin, process.cwd(), [shell])
+	try {
+		assert.deepEqual([...h.tools.keys()].sort(), [...TOOLS].sort())
+		// Top-level like the built-in it replaces, not tucked inside code mode.
+		assert.equal(h.tools.get("bash")?.options?.codemode, false)
+		assert.equal((await h.run("bash", { command: "echo PLUGIN_SHELL" }, "ses_s")).trim(), "PLUGIN_SHELL")
+	} finally {
+		await h.cleanup?.()
+	}
+})
+
 test("The guidance reaches the system prompt once, however often the hook runs", async () => {
 	const h = await loadV2(plugin)
 	try {
