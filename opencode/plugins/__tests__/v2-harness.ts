@@ -20,7 +20,7 @@ export interface FakeTool {
 	name: string
 	description: string
 	input: any
-	options?: { codemode?: boolean }
+	options?: { codemode?: boolean; permission?: string }
 	execute: (input: unknown, context: any) => Promise<{ content?: unknown }>
 }
 
